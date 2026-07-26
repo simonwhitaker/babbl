@@ -143,7 +143,13 @@ babbl completion fish > ~/.config/fish/completions/babbl.fish
 | `BABBL_DIR` | `$XDG_STATE_HOME/babbl`, else `~/.local/state/babbl` | State directory (also `--dir`) |
 
 The daemon binds to loopback only and has no authentication — it is not meant to
-be exposed to a network.
+be exposed to a network. Under Docker, publish the port on loopback:
+
+```sh
+docker run -d -p 127.0.0.1:8787:8787 -v babbl-state:/var/lib/babbl babbl
+```
+
+`docker compose up -d` does this for you.
 
 ## On-disk format
 

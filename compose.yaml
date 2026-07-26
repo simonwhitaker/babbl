@@ -1,0 +1,28 @@
+name: babbl
+
+services:
+  babbl:
+    build: .
+    command: ["serve", "--addr", "0.0.0.0:8787", "--verbose"]
+    # Published on loopback only: babbl has no auth and isn't meant to face a
+    # network. The container binds 0.0.0.0; this is what limits exposure.
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - state:/var/lib/babbl
+    environment:
+      # For client commands run inside the container, e.g.
+      #   docker compose exec babbl babbl pub review-comments 'hello'
+      BABBL_ADDR: 127.0.0.1:8787
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    # serve shuts down in ~2s on SIGTERM; no need for the 10s default.
+    stop_grace_period: 5s
+
+volumes:
+  state:
