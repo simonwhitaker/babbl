@@ -28,7 +28,20 @@ const (
 const defaultAddr = "127.0.0.1:8787"
 
 func main() {
-	err := rootCmd().Execute()
+	root := rootCmd()
+
+	// A root command with no RunE makes cobra print help and exit 0 for a bare
+	// `babbl`. An incomplete invocation must not look like success to a script
+	// or agent harness, so handle that one case here. Everything else —
+	// including unknown subcommands — stays with cobra, which already errors
+	// and offers suggestions.
+	if len(os.Args) == 1 {
+		root.Help()
+		fmt.Fprintln(os.Stderr, "babbl: a subcommand is required")
+		os.Exit(exitError)
+	}
+
+	err := root.Execute()
 	if err == nil {
 		os.Exit(exitOK)
 	}
@@ -53,14 +66,19 @@ consumer that starts an hour later still gets everything published for it.
 
   babbl serve &
   babbl pub review-comments 'fix nil deref in foo.go:42'
-  babbl sub review-comments --as codex`,
+  babbl sub review-comments --as codex
+
+Environment:
+  BABBL_ADDR   daemon address, same as --addr (default ` + defaultAddr + `)
+  BABBL_DIR    state directory for the daemon, same as 'serve --dir'
+               (default $XDG_STATE_HOME/babbl, else ~/.local/state/babbl)`,
 		SilenceUsage: true, // a runtime failure isn't a usage error
 		// Cobra prints errors itself, but with an "Error: " prefix that
 		// doesn't match the rest of our output. We print them instead.
 		SilenceErrors: true,
 	}
 
-	root.PersistentFlags().String("addr", addrFromEnv(), "daemon address")
+	root.PersistentFlags().String("addr", addrFromEnv(), "daemon address [$BABBL_ADDR]")
 	root.AddCommand(serveCmd(), pubCmd(), subCmd(), peekCmd(), topicsCmd())
 	return root
 }
@@ -147,7 +165,7 @@ to a network.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&dir, "dir", "", "state directory (default $BABBL_DIR, else $XDG_STATE_HOME/babbl)")
+	cmd.Flags().StringVar(&dir, "dir", "", "state directory [$BABBL_DIR] (default $XDG_STATE_HOME/babbl, else ~/.local/state/babbl)")
 	return cmd
 }
 

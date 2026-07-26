@@ -182,3 +182,25 @@ func TestHelpIsCleanAndUsesDoubleDashes(t *testing.T) {
 		t.Errorf("help still shows single-dash flags\n---\n%s", out)
 	}
 }
+
+// The point of readable help is that an agent can learn the whole invocation
+// from it, so the environment variables must be discoverable there too.
+func TestHelpDocumentsEnvironmentVariables(t *testing.T) {
+	root, err := runCLI(t, "", "--help")
+	if err != nil {
+		t.Fatalf("--help: %v", err)
+	}
+	for _, want := range []string{"BABBL_ADDR", "BABBL_DIR"} {
+		if !strings.Contains(root, want) {
+			t.Errorf("root help does not mention %s\n---\n%s", want, root)
+		}
+	}
+
+	serve, err := runCLI(t, "", "serve", "--help")
+	if err != nil {
+		t.Fatalf("serve --help: %v", err)
+	}
+	if !strings.Contains(serve, "BABBL_DIR") {
+		t.Errorf("serve --help does not mention BABBL_DIR\n---\n%s", serve)
+	}
+}
