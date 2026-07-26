@@ -11,7 +11,7 @@ import (
 func newTestServer(t *testing.T) (*Client, *Store) {
 	t.Helper()
 	store := newTestStore(t)
-	srv := httptest.NewServer(NewServer(store))
+	srv := httptest.NewServer(NewServer(store, nil))
 	t.Cleanup(srv.Close)
 	return NewClient(srv.URL), store
 }
@@ -57,7 +57,7 @@ func TestServerBacklogForNewSubscriber(t *testing.T) {
 // available; the client turns that into a retry loop.
 func TestServerLongPollReturns204(t *testing.T) {
 	store := newTestStore(t)
-	srv := httptest.NewServer(NewServer(store))
+	srv := httptest.NewServer(NewServer(store, nil))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/topics/quiet/next?as=codex&wait=100ms")
@@ -161,7 +161,7 @@ func TestServerTopics(t *testing.T) {
 
 func TestServerRejectsBadRequests(t *testing.T) {
 	store := newTestStore(t)
-	srv := httptest.NewServer(NewServer(store))
+	srv := httptest.NewServer(NewServer(store, nil))
 	defer srv.Close()
 
 	cases := []struct {

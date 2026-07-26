@@ -57,6 +57,30 @@ babbl peek review-comments
 babbl topics
 ```
 
+## Watching traffic
+
+`serve --verbose` prints a line to stderr as each message is published and
+delivered, like a web server's request log:
+
+```sh
+babbl serve --verbose
+```
+
+```
+15:04:05 pub    review-comments#0        from=claude        26B  "fix nil deref in foo.go:42"
+15:04:11 sub    review-comments#0        as=codex           26B  "fix nil deref in foo.go:42"
+15:04:12 pub    diffs#0                  from=claude      3.9kB  "diff --git a/main.go b/main.go\nindex 0a1b2c3…"
+15:04:20 peek   review-comments          1 message
+15:04:31 error  review-comments          invalid subscriber name: must match [A-Za-z0-9._-]+
+```
+
+Payloads are quoted and truncated, so a multi-line message stays on one line.
+
+Subscribers parked on an empty topic are not logged: `babbl sub` re-polls every
+minute for as long as it blocks, and logging that would bury the real traffic.
+A blocked subscriber shows up when a message actually reaches it — or in
+`babbl topics`, which lists every cursor.
+
 ## Semantics
 
 - **Fan-out, not load balancing.** Every distinct `--as` name receives every
@@ -64,6 +88,9 @@ babbl topics
   `codex` and `claude` they each get their own copy.
 - **Backlog by default.** A subscriber name seen for the first time starts at
   the beginning of the topic. Pass `--latest` to start at the end instead.
+- **Subscribers register on first contact.** A name shows up in `babbl topics`
+  as soon as it first asks for a message, even if it then blocks without
+  receiving one, so a subscriber parked on a quiet topic is still visible.
 - **At-most-once.** The cursor advances as soon as a message is handed over.
   There are no acks in this version, so a message is lost if the consumer dies
   mid-work.
@@ -83,7 +110,7 @@ The distinct timeout code lets an agent loop branch without parsing output.
 ## Commands
 
 ```
-babbl serve [--addr ADDR] [--dir PATH]
+babbl serve [--addr ADDR] [--dir PATH] [--verbose]
 babbl pub <topic> [message] [--from NAME] [--json]
 babbl sub <topic> --as NAME [--timeout D] [--latest] [--json]
 babbl peek <topic> [--from N] [--limit N] [--json]

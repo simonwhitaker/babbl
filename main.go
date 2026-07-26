@@ -114,6 +114,7 @@ func addrFromEnv() string {
 
 func serveCmd() *cobra.Command {
 	var dir string
+	var verbose bool
 
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -121,7 +122,16 @@ func serveCmd() *cobra.Command {
 		Long: `Run the babbl daemon.
 
 Binds to loopback only and has no authentication; it is not meant to be exposed
-to a network.`,
+to a network.
+
+--verbose prints a line to stderr as each message is published, delivered, or
+peeked at:
+
+  15:04:05 pub    review-comments#0        from=claude  26B  "fix nil deref…"
+  15:04:11 sub    review-comments#0        as=codex     26B  "fix nil deref…"
+
+Subscribers waiting on an empty topic are not logged; they re-poll on a timer
+and would drown out everything else.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			d := dir
@@ -141,7 +151,11 @@ to a network.`,
 			if err != nil {
 				return fmt.Errorf("listening on %s: %w", addr(cmd), err)
 			}
-			srv := &http.Server{Handler: NewServer(store)}
+			var log *eventLog
+			if verbose {
+				log = newEventLog(cmd.ErrOrStderr())
+			}
+			srv := &http.Server{Handler: NewServer(store, log)}
 			fmt.Fprintf(os.Stderr, "babbl serving on %s (state: %s)\n", ln.Addr(), d)
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
@@ -166,6 +180,7 @@ to a network.`,
 	}
 
 	cmd.Flags().StringVar(&dir, "dir", "", "state directory [$BABBL_DIR] (default $XDG_STATE_HOME/babbl, else ~/.local/state/babbl)")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "log each message as it is published and delivered")
 	return cmd
 }
 

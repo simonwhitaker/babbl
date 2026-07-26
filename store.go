@@ -236,6 +236,9 @@ func (s *Store) appendToLog(m Message) error {
 // If fromLatest is set and the subscriber has no cursor yet, its cursor starts
 // at the current end of the log rather than at 0, skipping the backlog.
 //
+// A subscriber's cursor is recorded the first time it asks, even if it then has
+// to wait, so that Topics can report who is listening to a quiet topic.
+//
 // The cursor advances as soon as the message is returned; there is no ack.
 func (s *Store) Next(ctx context.Context, topic, subscriber string, fromLatest bool) (Message, bool, error) {
 	if err := validTopic(topic); err != nil {
@@ -256,11 +259,6 @@ func (s *Store) Next(ctx context.Context, topic, subscriber string, fromLatest b
 		pos, seen := subs[subscriber]
 		if !seen && fromLatest {
 			pos = len(msgs)
-			subs[subscriber] = pos
-			if err := s.saveCursors(); err != nil {
-				s.mu.Unlock()
-				return Message{}, false, err
-			}
 		}
 		if pos < len(msgs) {
 			m := msgs[pos]
@@ -272,8 +270,20 @@ func (s *Store) Next(ctx context.Context, topic, subscriber string, fromLatest b
 			}
 			return m, true, nil
 		}
-		// Nothing to read. Grab the current notify channel before releasing
-		// the lock so an append racing with us can't slip through unnoticed.
+		// Nothing to read yet. Record where a first-time subscriber starts
+		// before parking on it, so that `babbl topics` shows it waiting rather
+		// than hiding it until something is finally delivered. This branch is
+		// only reachable with pos already at the end of the log, so the stored
+		// position is the one the subscriber would have resumed from anyway.
+		if !seen {
+			subs[subscriber] = pos
+			if err := s.saveCursors(); err != nil {
+				s.mu.Unlock()
+				return Message{}, false, err
+			}
+		}
+		// Grab the current notify channel before releasing the lock so an
+		// append racing with us can't slip through unnoticed.
 		wait := s.notify
 		s.mu.Unlock()
 

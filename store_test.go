@@ -87,11 +87,69 @@ func TestFromLatestSkipsBacklog(t *testing.T) {
 	if _, ok, err := s.Next(ctx, "review", "codex", true); ok || err != nil {
 		t.Fatalf("expected no backlog for --latest subscriber (ok=%v, err=%v)", ok, err)
 	}
+	// Waiting at the end of the log, not at the start of it.
+	if pos, ok := cursorFor(s.Topics(), "review", "codex"); !ok || pos != 1 {
+		t.Fatalf("--latest subscriber cursor is %d (present=%v), want 1", pos, ok)
+	}
 
 	s.Append("review", "new", "")
 	if m, ok := next(t, s, "review", "codex"); !ok || m.Payload != "new" {
 		t.Fatalf("got %q (ok=%v), want %q", m.Payload, ok, "new")
 	}
+}
+
+// A subscriber blocked on a quiet topic has to be visible in `babbl topics`
+// while it waits — that listing is the only way to see who is listening, since
+// the daemon's request log deliberately says nothing about idle subscribers.
+func TestParkedSubscriberIsVisibleInTopics(t *testing.T) {
+	s := newTestStore(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go s.Next(ctx, "quiet", "codex", false)
+
+	// The cursor is recorded just before the goroutine parks, so poll for it
+	// rather than guessing how long it needs to get there.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		pos, ok := cursorFor(s.Topics(), "quiet", "codex")
+		if ok {
+			if pos != 0 {
+				t.Fatalf("parked subscriber has cursor %d, want 0", pos)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("codex never showed up in Topics: %+v", s.Topics())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Registering a waiting subscriber must not consume anything on its behalf.
+func TestParkedSubscriberStillGetsLaterMessages(t *testing.T) {
+	s := newTestStore(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok, err := s.Next(ctx, "quiet", "codex", false); ok || err != nil {
+		t.Fatalf("expected nothing to be delivered (ok=%v, err=%v)", ok, err)
+	}
+
+	s.Append("quiet", "arrived later", "")
+	if m, ok := next(t, s, "quiet", "codex"); !ok || m.Payload != "arrived later" {
+		t.Fatalf("got %q (ok=%v), want %q", m.Payload, ok, "arrived later")
+	}
+}
+
+func cursorFor(infos []TopicInfo, topic, sub string) (int, bool) {
+	for _, info := range infos {
+		if info.Name == topic {
+			pos, ok := info.Cursors[sub]
+			return pos, ok
+		}
+	}
+	return 0, false
 }
 
 func TestStateSurvivesReopen(t *testing.T) {

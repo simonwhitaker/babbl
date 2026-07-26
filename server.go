@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -20,8 +21,9 @@ const defaultWait = 30 * time.Second
 // maxPayload bounds a single published message (1 MiB).
 const maxPayload = 1 << 20
 
-// NewServer builds the HTTP handler for a store.
-func NewServer(s *Store) http.Handler {
+// NewServer builds the HTTP handler for a store. A nil log disables the
+// request log; see eventLog.
+func NewServer(s *Store, log *eventLog) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -29,21 +31,27 @@ func NewServer(s *Store) http.Handler {
 	})
 
 	mux.HandleFunc("GET /topics", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, s.Topics())
+		infos := s.Topics()
+		log.event("topics", "", fmt.Sprintf("%d %s", len(infos), plural(len(infos), "topic")))
+		writeJSON(w, http.StatusOK, infos)
 	})
 
 	mux.HandleFunc("POST /topics/{topic}", func(w http.ResponseWriter, r *http.Request) {
 		topic := r.PathValue("topic")
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxPayload))
 		if err != nil {
+			log.event("error", topic, "payload too large")
 			writeError(w, http.StatusRequestEntityTooLarge, err)
 			return
 		}
-		m, err := s.Append(topic, string(body), r.URL.Query().Get("from"))
+		from := r.URL.Query().Get("from")
+		m, err := s.Append(topic, string(body), from)
 		if err != nil {
+			log.event("error", topic, err.Error())
 			writeStoreError(w, err)
 			return
 		}
+		log.msg("pub", m, field("from", from))
 		writeJSON(w, http.StatusCreated, m)
 	})
 
@@ -53,6 +61,7 @@ func NewServer(s *Store) http.Handler {
 
 		subscriber := q.Get("as")
 		if subscriber == "" {
+			log.event("error", topic, "missing subscriber name")
 			writeError(w, http.StatusBadRequest, errors.New("missing required query parameter: as"))
 			return
 		}
@@ -61,6 +70,7 @@ func NewServer(s *Store) http.Handler {
 		if v := q.Get("wait"); v != "" {
 			d, err := time.ParseDuration(v)
 			if err != nil {
+				log.event("error", topic, "invalid wait duration: "+safe(v))
 				writeError(w, http.StatusBadRequest, errors.New("invalid wait duration: "+v))
 				return
 			}
@@ -80,37 +90,53 @@ func NewServer(s *Store) http.Handler {
 
 		m, ok, err := s.Next(ctx, topic, subscriber, q.Get("from") == "latest")
 		if err != nil {
+			log.event("error", topic, err.Error())
 			writeStoreError(w, err)
 			return
 		}
 		if !ok {
+			// Nothing delivered: the client will simply ask again. Not logged.
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		log.msg("sub", m, field("as", subscriber))
 		writeJSON(w, http.StatusOK, m)
 	})
 
 	mux.HandleFunc("GET /topics/{topic}", func(w http.ResponseWriter, r *http.Request) {
+		topic := r.PathValue("topic")
 		q := r.URL.Query()
 		from, _ := strconv.Atoi(q.Get("from"))
 		limit := 50
 		if v := q.Get("limit"); v != "" {
 			n, err := strconv.Atoi(v)
 			if err != nil {
+				log.event("error", topic, "invalid limit: "+safe(v))
 				writeError(w, http.StatusBadRequest, errors.New("invalid limit: "+v))
 				return
 			}
 			limit = n
 		}
-		msgs, err := s.Peek(r.PathValue("topic"), from, limit)
+		msgs, err := s.Peek(topic, from, limit)
 		if err != nil {
+			log.event("error", topic, err.Error())
 			writeStoreError(w, err)
 			return
 		}
+		log.event("peek", topic, fmt.Sprintf("%d %s", len(msgs), plural(len(msgs), "message")))
 		writeJSON(w, http.StatusOK, msgs)
 	})
 
 	return mux
+}
+
+// field renders an optional key=value detail, or "" if the value is unset.
+// `from` is arbitrary text off the query string, hence safe.
+func field(key, value string) string {
+	if value == "" {
+		return ""
+	}
+	return key + "=" + safe(value)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -54,7 +54,7 @@ func runBinary(t *testing.T, env []string, args ...string) (string, int) {
 
 func TestProcessExitCodes(t *testing.T) {
 	store := newTestStore(t)
-	srv := httptest.NewServer(NewServer(store))
+	srv := httptest.NewServer(NewServer(store, nil))
 	defer srv.Close()
 	env := []string{"BABBL_ADDR=" + strings.TrimPrefix(srv.URL, "http://")}
 
@@ -115,7 +115,7 @@ func TestNoArgumentsPrintsHelp(t *testing.T) {
 // A sub timeout is a normal outcome, so it must not print an error.
 func TestSubTimeoutIsSilent(t *testing.T) {
 	store := newTestStore(t)
-	srv := httptest.NewServer(NewServer(store))
+	srv := httptest.NewServer(NewServer(store, nil))
 	defer srv.Close()
 	env := []string{"BABBL_ADDR=" + strings.TrimPrefix(srv.URL, "http://")}
 

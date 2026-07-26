@@ -16,7 +16,7 @@ func startDaemon(t *testing.T) *Store {
 	t.Helper()
 
 	store := newTestStore(t)
-	srv := httptest.NewServer(NewServer(store))
+	srv := httptest.NewServer(NewServer(store, nil))
 	t.Cleanup(srv.Close)
 	t.Setenv("BABBL_ADDR", strings.TrimPrefix(srv.URL, "http://"))
 	return store
