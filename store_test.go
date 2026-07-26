@@ -1,0 +1,246 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	return s
+}
+
+// next is a helper for the common "should return promptly" case.
+func next(t *testing.T, s *Store, topic, sub string) (Message, bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	m, ok, err := s.Next(ctx, topic, sub, false)
+	if err != nil {
+		t.Fatalf("Next(%s, %s): %v", topic, sub, err)
+	}
+	return m, ok
+}
+
+func TestAppendThenNext(t *testing.T) {
+	s := newTestStore(t)
+
+	if _, err := s.Append("review", "fix nil deref", "claude"); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	m, ok := next(t, s, "review", "codex")
+	if !ok {
+		t.Fatal("expected a message")
+	}
+	if m.Payload != "fix nil deref" || m.ID != 0 || m.From != "claude" {
+		t.Fatalf("unexpected message: %+v", m)
+	}
+
+	// Cursor advanced, so a second read has nothing.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok, _ := s.Next(ctx, "review", "codex", false); ok {
+		t.Fatal("expected no second message")
+	}
+}
+
+// Each named subscriber has its own cursor, so both see every message.
+func TestFanOutToMultipleSubscribers(t *testing.T) {
+	s := newTestStore(t)
+	s.Append("review", "one", "")
+	s.Append("review", "two", "")
+
+	for _, sub := range []string{"codex", "claude"} {
+		for _, want := range []string{"one", "two"} {
+			m, ok := next(t, s, "review", sub)
+			if !ok || m.Payload != want {
+				t.Fatalf("%s: got %q (ok=%v), want %q", sub, m.Payload, ok, want)
+			}
+		}
+	}
+}
+
+// The motivating case: publish with nobody listening, subscribe later.
+func TestBacklogDeliveredToLateSubscriber(t *testing.T) {
+	s := newTestStore(t)
+	s.Append("review", "published before anyone subscribed", "")
+
+	m, ok := next(t, s, "review", "codex")
+	if !ok || m.Payload != "published before anyone subscribed" {
+		t.Fatalf("got %q (ok=%v)", m.Payload, ok)
+	}
+}
+
+func TestFromLatestSkipsBacklog(t *testing.T) {
+	s := newTestStore(t)
+	s.Append("review", "old", "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, ok, err := s.Next(ctx, "review", "codex", true); ok || err != nil {
+		t.Fatalf("expected no backlog for --latest subscriber (ok=%v, err=%v)", ok, err)
+	}
+
+	s.Append("review", "new", "")
+	if m, ok := next(t, s, "review", "codex"); !ok || m.Payload != "new" {
+		t.Fatalf("got %q (ok=%v), want %q", m.Payload, ok, "new")
+	}
+}
+
+func TestStateSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+
+	s1, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	s1.Append("review", "one", "claude")
+	s1.Append("review", "two", "claude")
+	if m, ok := next(t, s1, "review", "codex"); !ok || m.Payload != "one" {
+		t.Fatalf("setup read failed: %q ok=%v", m.Payload, ok)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+
+	// Messages reloaded from disk...
+	msgs, err := s2.Peek("review", 0, 0)
+	if err != nil {
+		t.Fatalf("Peek: %v", err)
+	}
+	if len(msgs) != 2 || msgs[1].Payload != "two" || msgs[1].From != "claude" {
+		t.Fatalf("unexpected reloaded messages: %+v", msgs)
+	}
+
+	// ...and the cursor picks up where it left off rather than replaying.
+	if m, ok := next(t, s2, "review", "codex"); !ok || m.Payload != "two" {
+		t.Fatalf("after reopen got %q (ok=%v), want %q", m.Payload, ok, "two")
+	}
+}
+
+// A blocked Next must wake when a message arrives, not just on timeout.
+func TestNextWakesOnAppend(t *testing.T) {
+	s := newTestStore(t)
+
+	type result struct {
+		m  Message
+		ok bool
+	}
+	done := make(chan result, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		m, ok, err := s.Next(ctx, "review", "codex", false)
+		if err != nil {
+			t.Errorf("Next: %v", err)
+		}
+		done <- result{m, ok}
+	}()
+
+	// Give the goroutine a moment to actually be parked on the notify channel.
+	time.Sleep(50 * time.Millisecond)
+	if _, err := s.Append("review", "late arrival", ""); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	select {
+	case r := <-done:
+		if !r.ok || r.m.Payload != "late arrival" {
+			t.Fatalf("got %q (ok=%v)", r.m.Payload, r.ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Next did not wake on Append")
+	}
+}
+
+func TestNextReturnsFalseOnContextExpiry(t *testing.T) {
+	s := newTestStore(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	m, ok, err := s.Next(ctx, "quiet", "codex", false)
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected no message, got %+v", m)
+	}
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Fatalf("returned too early: %v", elapsed)
+	}
+}
+
+func TestPeekDoesNotAdvanceCursor(t *testing.T) {
+	s := newTestStore(t)
+	s.Append("review", "one", "")
+	s.Append("review", "two", "")
+
+	if msgs, _ := s.Peek("review", 0, 0); len(msgs) != 2 {
+		t.Fatalf("Peek returned %d messages, want 2", len(msgs))
+	}
+	if msgs, _ := s.Peek("review", 1, 0); len(msgs) != 1 || msgs[0].Payload != "two" {
+		t.Fatalf("Peek(from=1) = %+v", msgs)
+	}
+	if msgs, _ := s.Peek("review", 0, 1); len(msgs) != 1 || msgs[0].Payload != "one" {
+		t.Fatalf("Peek(limit=1) = %+v", msgs)
+	}
+	if msgs, _ := s.Peek("review", 99, 0); len(msgs) != 0 {
+		t.Fatalf("Peek past end = %+v", msgs)
+	}
+
+	// Cursor untouched by all that peeking.
+	if m, ok := next(t, s, "review", "codex"); !ok || m.Payload != "one" {
+		t.Fatalf("got %q (ok=%v), want %q", m.Payload, ok, "one")
+	}
+}
+
+func TestTopics(t *testing.T) {
+	s := newTestStore(t)
+	s.Append("review", "one", "")
+	s.Append("review", "two", "")
+	s.Append("alerts", "boom", "")
+	next(t, s, "review", "codex")
+
+	infos := s.Topics()
+	if len(infos) != 2 {
+		t.Fatalf("got %d topics, want 2", len(infos))
+	}
+	// Sorted by name: alerts before review.
+	if infos[0].Name != "alerts" || infos[1].Name != "review" {
+		t.Fatalf("unexpected order: %+v", infos)
+	}
+	if infos[1].Count != 2 || infos[1].Cursors["codex"] != 1 {
+		t.Fatalf("unexpected review info: %+v", infos[1])
+	}
+}
+
+func TestInvalidNamesRejected(t *testing.T) {
+	s := newTestStore(t)
+
+	// Bounded so a validation regression shows up as a failure rather than a
+	// Next that blocks forever waiting for a message.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	for _, bad := range []string{"", "../escape", "has/slash", "has space", ".", ".."} {
+		if _, err := s.Append(bad, "x", ""); !errors.Is(err, ErrInvalidTopic) {
+			t.Errorf("Append(%q): got %v, want ErrInvalidTopic", bad, err)
+		}
+		if _, _, err := s.Next(ctx, bad, "codex", false); !errors.Is(err, ErrInvalidTopic) {
+			t.Errorf("Next(topic=%q): got %v, want ErrInvalidTopic", bad, err)
+		}
+		if _, _, err := s.Next(ctx, "review", bad, false); !errors.Is(err, ErrInvalidSubscriber) {
+			t.Errorf("Next(sub=%q): got %v, want ErrInvalidSubscriber", bad, err)
+		}
+	}
+}
