@@ -9,7 +9,7 @@ that starts an hour later still gets everything that was published for it.
 The motivating case: Claude finishes a code review and pushes the comments to a
 topic; Codex picks them up and addresses them, whenever it next runs.
 
-No broker, no config, no dependencies beyond the Go standard library.
+No broker and no config. The only dependency is cobra, for the CLI.
 
 ## Install
 
@@ -90,10 +90,23 @@ babbl peek <topic> [--from N] [--limit N] [--json]
 babbl topics [--json]
 ```
 
+`babbl help <command>` or `babbl <command> --help` documents each one.
+
 Flags may appear before or after the positional arguments. Use `--` to publish a
-message that starts with a dash.
+message that starts with a dash:
+
+```sh
+babbl pub notes -- '--this is not a flag'
+```
 
 Topic and subscriber names must match `[A-Za-z0-9._-]+`.
+
+Shell completions:
+
+```sh
+babbl completion fish > ~/.config/fish/completions/babbl.fish
+# also: bash, zsh, powershell
+```
 
 ## Configuration
 
@@ -133,3 +146,10 @@ GET  /healthz
 Acks and redelivery, log compaction, wildcard subscriptions, competing-consumer
 groups, and auth. The on-disk log plus cursor map is a reasonable substrate for
 all of them if they turn out to be needed.
+
+## Development
+
+```sh
+go test ./...
+go build -o babbl .
+```

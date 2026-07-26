@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/spf13/cobra"
 )
 
 const (
@@ -26,58 +27,48 @@ const (
 
 const defaultAddr = "127.0.0.1:8787"
 
-const usage = `babbl - a local pubsub daemon for coding agents
-
-Usage:
-  babbl serve [--addr ADDR] [--dir PATH]
-  babbl pub <topic> [message]        publish (reads stdin if message omitted)
-  babbl sub <topic> --as NAME        block until the next unread message
-  babbl peek <topic> [--from N]      read without advancing any cursor
-  babbl topics                       list topics, counts and cursors
-
-Environment:
-  BABBL_ADDR   daemon address (default ` + defaultAddr + `)
-  BABBL_DIR    state directory (default $XDG_STATE_HOME/babbl)
-
-Exit codes for sub: 0 message delivered, 3 timed out, 1 error.
-`
-
 func main() {
-	os.Exit(run(os.Args[1:]))
+	err := rootCmd().Execute()
+	if err == nil {
+		os.Exit(exitOK)
+	}
+	// A `sub` timeout is a normal outcome, not a failure: exit 3 silently so
+	// shell loops can branch on it.
+	if errors.Is(err, errSubTimeout) {
+		os.Exit(exitTimeout)
+	}
+	fmt.Fprintf(os.Stderr, "babbl: %v\n", err)
+	os.Exit(exitError)
 }
 
-func run(args []string) int {
-	if len(args) == 0 {
-		fmt.Fprint(os.Stderr, usage)
-		return exitError
+func rootCmd() *cobra.Command {
+	root := &cobra.Command{
+		Use:   "babbl",
+		Short: "A local pubsub daemon for coding agents",
+		Long: `babbl is a local pubsub daemon for coding agents.
+
+One agent publishes to a topic, another subscribes to it. Messages are held in
+a durable log on disk and each named subscriber has its own cursor, so a
+consumer that starts an hour later still gets everything published for it.
+
+  babbl serve &
+  babbl pub review-comments 'fix nil deref in foo.go:42'
+  babbl sub review-comments --as codex`,
+		SilenceUsage: true, // a runtime failure isn't a usage error
+		// Cobra prints errors itself, but with an "Error: " prefix that
+		// doesn't match the rest of our output. We print them instead.
+		SilenceErrors: true,
 	}
 
-	cmd, rest := args[0], args[1:]
-	var err error
-	switch cmd {
-	case "serve":
-		err = cmdServe(rest)
-	case "pub", "publish":
-		err = cmdPub(rest)
-	case "sub", "subscribe":
-		return cmdSub(rest)
-	case "peek":
-		err = cmdPeek(rest)
-	case "topics":
-		err = cmdTopics(rest)
-	case "help", "-h", "--help":
-		fmt.Print(usage)
-		return exitOK
-	default:
-		fmt.Fprintf(os.Stderr, "babbl: unknown command %q\n\n%s", cmd, usage)
-		return exitError
-	}
+	root.PersistentFlags().String("addr", addrFromEnv(), "daemon address")
+	root.AddCommand(serveCmd(), pubCmd(), subCmd(), peekCmd(), topicsCmd())
+	return root
+}
 
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "babbl: %v\n", err)
-		return exitError
-	}
-	return exitOK
+// addr reads the --addr flag, which is defined once on the root command.
+func addr(cmd *cobra.Command) string {
+	v, _ := cmd.Flags().GetString("addr")
+	return v
 }
 
 // stateDir resolves the state directory: $BABBL_DIR, else $XDG_STATE_HOME/babbl,
@@ -103,233 +94,235 @@ func addrFromEnv() string {
 	return defaultAddr
 }
 
-func cmdServe(args []string) error {
-	fs := newFlagSet("serve")
-	addr := fs.String("addr", addrFromEnv(), "address to listen on")
-	dir := fs.String("dir", "", "state directory (default $BABBL_DIR or $XDG_STATE_HOME/babbl)")
-	if _, err := parseArgs(fs, args); err != nil {
-		return err
+func serveCmd() *cobra.Command {
+	var dir string
+
+	cmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Run the babbl daemon",
+		Long: `Run the babbl daemon.
+
+Binds to loopback only and has no authentication; it is not meant to be exposed
+to a network.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			d := dir
+			if d == "" {
+				var err error
+				if d, err = stateDir(); err != nil {
+					return err
+				}
+			}
+
+			store, err := Open(d)
+			if err != nil {
+				return err
+			}
+
+			ln, err := net.Listen("tcp", addr(cmd))
+			if err != nil {
+				return fmt.Errorf("listening on %s: %w", addr(cmd), err)
+			}
+			srv := &http.Server{Handler: NewServer(store)}
+			fmt.Fprintf(os.Stderr, "babbl serving on %s (state: %s)\n", ln.Addr(), d)
+
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
+			errCh := make(chan error, 1)
+			go func() { errCh <- srv.Serve(ln) }()
+
+			select {
+			case err := <-errCh:
+				if errors.Is(err, http.ErrServerClosed) {
+					return nil
+				}
+				return err
+			case <-ctx.Done():
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				srv.Shutdown(shutdownCtx)
+				return nil
+			}
+		},
 	}
 
-	d := *dir
-	if d == "" {
-		var err error
-		if d, err = stateDir(); err != nil {
-			return err
-		}
-	}
+	cmd.Flags().StringVar(&dir, "dir", "", "state directory (default $BABBL_DIR, else $XDG_STATE_HOME/babbl)")
+	return cmd
+}
 
-	store, err := Open(d)
-	if err != nil {
-		return err
-	}
+func pubCmd() *cobra.Command {
+	var from string
+	var asJSON bool
 
-	srv := &http.Server{Handler: NewServer(store)}
-	ln, err := net.Listen("tcp", *addr)
-	if err != nil {
-		return fmt.Errorf("listening on %s: %w", *addr, err)
-	}
+	cmd := &cobra.Command{
+		Use:   "pub <topic> [message]",
+		Short: "Publish a message to a topic",
+		Long: `Publish a message to a topic.
 
-	fmt.Fprintf(os.Stderr, "babbl serving on %s (state: %s)\n", ln.Addr(), d)
+Reads the payload from stdin if no message argument is given, which is how
+multi-line content gets published.`,
+		Example: `  babbl pub review-comments 'fix nil deref in foo.go:42'
+  babbl pub review-comments 'needs a test' --from claude
+  git diff | babbl pub diffs`,
+		Args:    cobra.MinimumNArgs(1),
+		Aliases: []string{"publish"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			topic := args[0]
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+			var payload string
+			if len(args) > 1 {
+				payload = strings.Join(args[1:], " ")
+			} else {
+				data, err := io.ReadAll(cmd.InOrStdin())
+				if err != nil {
+					return fmt.Errorf("reading stdin: %w", err)
+				}
+				payload = strings.TrimRight(string(data), "\n")
+			}
+			if payload == "" {
+				return errors.New("refusing to publish an empty message")
+			}
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Serve(ln) }()
-
-	select {
-	case err := <-errCh:
-		if errors.Is(err, http.ErrServerClosed) {
+			m, err := NewClient(addr(cmd)).Publish(cmd.Context(), topic, payload, from)
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				return printJSON(cmd.OutOrStdout(), m)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "%s#%d\n", m.Topic, m.ID)
 			return nil
-		}
-		return err
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		srv.Shutdown(shutdownCtx)
-		return nil
+		},
 	}
+
+	cmd.Flags().StringVar(&from, "from", "", "publisher name recorded on the message")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print the full message envelope")
+	return cmd
 }
 
-func cmdPub(args []string) error {
-	fs := newFlagSet("pub")
-	from := fs.String("from", "", "optional publisher name recorded on the message")
-	asJSON := fs.Bool("json", false, "print the full message envelope")
-	addr := fs.String("addr", addrFromEnv(), "daemon address")
-	rest, err := parseArgs(fs, args)
-	if err != nil {
-		return err
-	}
-	if len(rest) == 0 {
-		return errors.New("usage: babbl pub <topic> [message]")
-	}
-	topic := rest[0]
+// errSubTimeout maps to exit code 3 so shell loops can branch on "nothing
+// arrived" without parsing output. It is silent: nothing is printed for it.
+var errSubTimeout = errors.New("timed out waiting for a message")
 
-	var payload string
-	if len(rest) > 1 {
-		payload = strings.Join(rest[1:], " ")
-	} else {
-		data, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			return fmt.Errorf("reading stdin: %w", err)
-		}
-		payload = strings.TrimRight(string(data), "\n")
-	}
-	if payload == "" {
-		return errors.New("refusing to publish an empty message")
+func subCmd() *cobra.Command {
+	var as string
+	var timeout time.Duration
+	var asJSON, fromLatest bool
+
+	cmd := &cobra.Command{
+		Use:   "sub <topic>",
+		Short: "Block until the next unread message on a topic",
+		Long: `Block until the next unread message on a topic, print it, and exit.
+
+--as names the subscriber, and that name is what owns the read cursor. Every
+distinct name receives every message on the topic; two subscribers sharing a
+name share one cursor.
+
+A name seen for the first time starts at the beginning of the topic and works
+through the backlog. Pass --latest to start at the end instead.
+
+Exit codes: 0 a message was printed, 3 timed out with nothing to deliver,
+1 error.`,
+		Example: `  babbl sub review-comments --as codex
+
+  # drain a topic, then stop once it goes quiet
+  while babbl sub review-comments --as codex --timeout 5s; do :; done`,
+		Args:    cobra.ExactArgs(1),
+		Aliases: []string{"subscribe"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := contextWithOptionalTimeout(cmd.Context(), timeout)
+			defer cancel()
+			ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
+			m, ok, err := NewClient(addr(cmd)).Next(ctx, args[0], as, fromLatest)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errSubTimeout
+			}
+			if asJSON {
+				return printJSON(cmd.OutOrStdout(), m)
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), m.Payload)
+			return nil
+		},
 	}
 
-	m, err := NewClient(*addr).Publish(context.Background(), topic, payload, *from)
-	if err != nil {
-		return err
-	}
-	if *asJSON {
-		return printJSON(m)
-	}
-	fmt.Printf("%s#%d\n", m.Topic, m.ID)
-	return nil
+	cmd.Flags().StringVar(&as, "as", "", "subscriber name; owns the read cursor (required)")
+	cmd.Flags().DurationVar(&timeout, "timeout", 0, "give up after this long (0 waits forever)")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print the full message envelope instead of the payload")
+	cmd.Flags().BoolVar(&fromLatest, "latest", false, "for a new subscriber, skip the backlog and start at the end")
+	cmd.MarkFlagRequired("as")
+	return cmd
 }
 
-func cmdSub(args []string) int {
-	fs := newFlagSet("sub")
-	as := fs.String("as", "", "subscriber name (required); each name has its own cursor")
-	timeout := fs.Duration("timeout", 0, "give up after this long (0 = wait forever)")
-	asJSON := fs.Bool("json", false, "print the full message envelope instead of the payload")
-	fromLatest := fs.Bool("latest", false, "for a new subscriber, skip the backlog and start at the end")
-	addr := fs.String("addr", addrFromEnv(), "daemon address")
+func peekCmd() *cobra.Command {
+	var from, limit int
+	var asJSON bool
 
-	fail := func(err error) int {
-		fmt.Fprintf(os.Stderr, "babbl: %v\n", err)
-		return exitError
-	}
-
-	rest, err := parseArgs(fs, args)
-	if err != nil {
-		return fail(err)
-	}
-	if len(rest) != 1 {
-		return fail(errors.New("usage: babbl sub <topic> --as NAME"))
-	}
-	if *as == "" {
-		return fail(errors.New("--as NAME is required so the subscriber has its own cursor"))
-	}
-
-	ctx, cancel := contextWithOptionalTimeout(context.Background(), *timeout)
-	defer cancel()
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	m, ok, err := NewClient(*addr).Next(ctx, rest[0], *as, *fromLatest)
-	if err != nil {
-		return fail(err)
-	}
-	if !ok {
-		return exitTimeout
+	cmd := &cobra.Command{
+		Use:     "peek <topic>",
+		Short:   "Read a topic without advancing any cursor",
+		Args:    cobra.ExactArgs(1),
+		Example: `  babbl peek review-comments --limit 5`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			msgs, err := NewClient(addr(cmd)).Peek(cmd.Context(), args[0], from, limit)
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			if asJSON {
+				return printJSON(out, msgs)
+			}
+			for _, m := range msgs {
+				fmt.Fprintf(out, "[%d] %s\n", m.ID, m.Payload)
+			}
+			return nil
+		},
 	}
 
-	if *asJSON {
-		if err := printJSON(m); err != nil {
-			return fail(err)
-		}
-		return exitOK
-	}
-	fmt.Println(m.Payload)
-	return exitOK
+	cmd.Flags().IntVar(&from, "from", 0, "start at this message ID")
+	cmd.Flags().IntVar(&limit, "limit", 20, "maximum messages to show (0 for all)")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print full message envelopes")
+	return cmd
 }
 
-func cmdPeek(args []string) error {
-	fs := newFlagSet("peek")
-	from := fs.Int("from", 0, "start at this message ID")
-	limit := fs.Int("limit", 20, "maximum messages to show (0 = all)")
-	asJSON := fs.Bool("json", false, "print full message envelopes")
-	addr := fs.String("addr", addrFromEnv(), "daemon address")
-	rest, err := parseArgs(fs, args)
-	if err != nil {
-		return err
-	}
-	if len(rest) != 1 {
-		return errors.New("usage: babbl peek <topic>")
+func topicsCmd() *cobra.Command {
+	var asJSON bool
+
+	cmd := &cobra.Command{
+		Use:   "topics",
+		Short: "List topics with message counts and subscriber cursors",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			infos, err := NewClient(addr(cmd)).Topics(cmd.Context())
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			if asJSON {
+				return printJSON(out, infos)
+			}
+			if len(infos) == 0 {
+				fmt.Fprintln(out, "no topics yet")
+				return nil
+			}
+			for _, info := range infos {
+				fmt.Fprintf(out, "%s (%d %s)\n", info.Name, info.Count, plural(info.Count, "message"))
+				for _, sub := range sortedKeys(info.Cursors) {
+					pos := info.Cursors[sub]
+					fmt.Fprintf(out, "  %s: %d/%d (%d unread)\n", sub, pos, info.Count, max(0, info.Count-pos))
+				}
+			}
+			return nil
+		},
 	}
 
-	msgs, err := NewClient(*addr).Peek(context.Background(), rest[0], *from, *limit)
-	if err != nil {
-		return err
-	}
-	if *asJSON {
-		return printJSON(msgs)
-	}
-	for _, m := range msgs {
-		fmt.Printf("[%d] %s\n", m.ID, m.Payload)
-	}
-	return nil
-}
-
-func cmdTopics(args []string) error {
-	fs := newFlagSet("topics")
-	asJSON := fs.Bool("json", false, "print JSON")
-	addr := fs.String("addr", addrFromEnv(), "daemon address")
-	if _, err := parseArgs(fs, args); err != nil {
-		return err
-	}
-
-	infos, err := NewClient(*addr).Topics(context.Background())
-	if err != nil {
-		return err
-	}
-	if *asJSON {
-		return printJSON(infos)
-	}
-	if len(infos) == 0 {
-		fmt.Println("no topics yet")
-		return nil
-	}
-	for _, info := range infos {
-		fmt.Printf("%s (%d %s)\n", info.Name, info.Count, plural(info.Count, "message"))
-		for _, sub := range sortedKeys(info.Cursors) {
-			pos := info.Cursors[sub]
-			fmt.Printf("  %s: %d/%d (%d unread)\n", sub, pos, info.Count, max(0, info.Count-pos))
-		}
-	}
-	return nil
-}
-
-// parseArgs parses flags that may appear before, after, or between positional
-// arguments. Stdlib flag stops at the first non-flag token, which would make
-// the natural `babbl sub <topic> --as codex` silently ignore --as.
-//
-// Everything after a literal "--" is treated as positional verbatim, which is
-// how you publish a message that starts with "-".
-func parseArgs(fs *flag.FlagSet, args []string) ([]string, error) {
-	var verbatim []string
-	for i, a := range args {
-		if a == "--" {
-			args, verbatim = args[:i], args[i+1:]
-			break
-		}
-	}
-
-	var positional []string
-	for len(args) > 0 {
-		if err := fs.Parse(args); err != nil {
-			return nil, err
-		}
-		rest := fs.Args()
-		if len(rest) == 0 {
-			break
-		}
-		positional = append(positional, rest[0])
-		args = rest[1:]
-	}
-	return append(positional, verbatim...), nil
-}
-
-// newFlagSet returns a FlagSet that reports errors instead of calling os.Exit,
-// so parseArgs can surface them through the normal error path.
-func newFlagSet(name string) *flag.FlagSet {
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	return fs
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	return cmd
 }
 
 func plural(n int, word string) string {
@@ -339,8 +332,8 @@ func plural(n int, word string) string {
 	return word + "s"
 }
 
-func printJSON(v any) error {
-	enc := json.NewEncoder(os.Stdout)
+func printJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
 }
