@@ -13,11 +13,23 @@ No broker and no config. The only dependency is cobra, for the CLI.
 
 ## Install
 
+Using Homebrew:
+
+```sh
+brew install simonwhitaker/tap/babbl
+```
+
+Or using Go:
+
 ```sh
 go install github.com/simonwhitaker/babbl@latest
 ```
 
-Or from a checkout: `go build -o babbl .`
+Or from a checkout:
+
+```sh
+go build -o babbl .
+```
 
 ## Use
 
