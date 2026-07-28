@@ -1,0 +1,32 @@
+shell: /bin/bash
+commands:
+  clean:
+    run: |
+      go clean ./...
+      rm -rf dist
+  modernize:
+    description: Run the modernize tool and fix all
+    run: go run golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@latest -fix ./...
+  release:
+    description: Push a git tag to trigger a release. The tag must be in the format vX.Y.Z, e.g. v1.2.3.
+    argnames:
+      - tag
+    run: git tag -am $tag $tag && git push origin refs/tags/$tag
+  release-next:
+    description: Automatically determine the next version and push a git tag to trigger a release.
+    run: |
+      latest_version=$(git tag --list "v*" --sort "-refname" | head -1)
+      next_version=$(echo ${latest_version} | awk -F. -v OFS=. '{$NF += 1 ; print}')
+      printf "Release $next_version? (Current release is $latest_version) [yN] "
+      read answer
+      if [[ $answer =~ ^[Yy]$ ]]; then
+        git tag -am $next_version $next_version && git push origin refs/tags/$next_version
+      fi
+  test:
+    run: go test ./...
+  test-coverage:
+    run: go test -coverprofile=c.out ./... && go tool cover -func="c.out"
+  test-coverage-html:
+    run: go test -coverprofile=c.out ./... && go tool cover -html="c.out"
+  update-deps:
+    run: go get -u . && go mod tidy
