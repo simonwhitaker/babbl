@@ -110,11 +110,11 @@ A blocked subscriber shows up when a message actually reaches it — or in
 
 ## Exit codes for `babbl sub`
 
-| Code | Meaning |
-|---|---|
-| `0` | A message was delivered on stdout |
-| `3` | Timed out (`--timeout`) with nothing to deliver |
-| `1` | Error |
+| Code | Meaning                                         |
+| ---- | ----------------------------------------------- |
+| `0`  | A message was delivered on stdout               |
+| `3`  | Timed out (`--timeout`) with nothing to deliver |
+| `1`  | Error                                           |
 
 The distinct timeout code lets an agent loop branch without parsing output.
 `--timeout 0` (the default) blocks indefinitely.
@@ -149,10 +149,10 @@ babbl completion fish > ~/.config/fish/completions/babbl.fish
 
 ## Configuration
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `BABBL_ADDR` | `127.0.0.1:8787` | Daemon address (also `--addr`) |
-| `BABBL_DIR` | `$XDG_STATE_HOME/babbl`, else `~/.local/state/babbl` | State directory (also `--dir`) |
+| Variable     | Default                                              | Purpose                        |
+| ------------ | ---------------------------------------------------- | ------------------------------ |
+| `BABBL_ADDR` | `127.0.0.1:8787`                                     | Daemon address (also `--addr`) |
+| `BABBL_DIR`  | `$XDG_STATE_HOME/babbl`, else `~/.local/state/babbl` | State directory (also `--dir`) |
 
 The daemon binds to loopback only and has no authentication — it is not meant to
 be exposed to a network. Under Docker, publish the port on loopback:
