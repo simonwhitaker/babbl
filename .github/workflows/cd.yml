@@ -11,8 +11,8 @@ permissions:
 
 jobs:
   goreleaser:
-    # Generates the Github release, and updates the simonwhitaker/tap/gibo
-    # Homebrew formula
+    # Generates the Github release, and updates the simonwhitaker/tap/babbl
+    # Homebrew cask
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -36,7 +36,7 @@ jobs:
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: |
-            runny
+            babbl
             homebrew-tap
           permission-contents: write
 
