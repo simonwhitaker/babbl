@@ -43,13 +43,7 @@ homebrew_casks:
       name: Simon Whitaker
       email: sw@netcetera.org
     generate_completions_from_executable:
-      args:
-        - completion
       shell_parameter_format: cobra
-      shells:
-        - bash
-        - zsh
-        - fish
     hooks:
       post:
         install: |
