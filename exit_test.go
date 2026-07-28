@@ -44,8 +44,7 @@ func runBinary(t *testing.T, env []string, args ...string) (string, int) {
 	if err == nil {
 		return string(out), 0
 	}
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
+	if ee, ok := errors.AsType[*exec.ExitError](err); ok {
 		return string(out), ee.ExitCode()
 	}
 	t.Fatalf("running babbl %v: %v", args, err)

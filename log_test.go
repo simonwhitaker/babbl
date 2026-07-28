@@ -169,7 +169,7 @@ func TestPreview(t *testing.T) {
 func TestPreviewStaysWellFormedAtEveryOffset(t *testing.T) {
 	nel := string(rune(0x85))
 	for _, mid := range []string{"\x01", "\x7f", "\n", "\t", nel, "\\", `"`, "é", "😀"} {
-		for n := 0; n < previewLen+8; n++ {
+		for n := range previewLen + 8 {
 			in := strings.Repeat("a", n) + mid + strings.Repeat("b", 8)
 			got := preview(in)
 

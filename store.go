@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -341,9 +342,7 @@ func (s *Store) Topics() []TopicInfo {
 	out := make([]TopicInfo, 0, len(names))
 	for _, name := range names {
 		cursors := map[string]int{}
-		for sub, pos := range s.cursors[name] {
-			cursors[sub] = pos
-		}
+		maps.Copy(cursors, s.cursors[name])
 		out = append(out, TopicInfo{
 			Name:    name,
 			Count:   len(s.topics[name]),
