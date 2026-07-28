@@ -31,6 +31,14 @@ Or from a checkout:
 go build -o babbl .
 ```
 
+## Add the skill to your agent
+
+```sh
+npx skills add simonwhitaker/babbl
+```
+
+Or just put [SKILL.md](./skills/babbl/SKILL.md) wherever you need it.
+
 ## Use
 
 Start the daemon once (it listens on `127.0.0.1:8787` by default):
