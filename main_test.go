@@ -143,6 +143,9 @@ func TestWrongArgCounts(t *testing.T) {
 		{"sub", "one", "two", "--as", "codex"}, // too many topics
 		{"peek"},                               // no topic
 		{"topics", "unexpected"},               // topics takes none
+		{"topics", "ls", "unexpected"},         // nor does ls
+		{"topics", "rm"},                       // no topic
+		{"topics", "rm", "one", "two"},         // one topic at a time
 		{"serve", "unexpected"},                // serve takes none
 	}
 	for _, args := range cases {
@@ -202,5 +205,99 @@ func TestHelpDocumentsEnvironmentVariables(t *testing.T) {
 	}
 	if !strings.Contains(serve, "BABBL_DIR") {
 		t.Errorf("serve --help does not mention BABBL_DIR\n---\n%s", serve)
+	}
+}
+
+func TestTopicsListsWithAndWithoutLs(t *testing.T) {
+	store := startDaemon(t)
+	store.Append("review", "one", "")
+
+	for _, args := range [][]string{{"topics"}, {"topics", "ls"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			out, err := runCLI(t, "", args...)
+			if err != nil {
+				t.Fatalf("%v: %v", args, err)
+			}
+			if out != "review (1 message)\n" {
+				t.Fatalf("got %q", out)
+			}
+		})
+	}
+
+	out, err := runCLI(t, "", "topics", "ls", "--json")
+	if err != nil || !strings.Contains(out, `"name": "review"`) {
+		t.Fatalf("topics ls --json: %v\n%s", err, out)
+	}
+}
+
+func TestTopicsRm(t *testing.T) {
+	for _, verb := range []string{"rm", "delete"} {
+		t.Run(verb, func(t *testing.T) {
+			store := startDaemon(t)
+			store.Append("review", "one", "")
+			store.Append("alerts", "boom", "")
+
+			out, err := runCLI(t, "", "topics", verb, "review")
+			if err != nil {
+				t.Fatalf("topics %s: %v", verb, err)
+			}
+			if out != "" {
+				t.Fatalf("expected no output on success, got %q", out)
+			}
+			if infos := store.Topics(); len(infos) != 1 || infos[0].Name != "alerts" {
+				t.Fatalf("unexpected topics: %+v", infos)
+			}
+		})
+	}
+}
+
+func TestTopicsRmUnknownTopicFails(t *testing.T) {
+	startDaemon(t)
+	_, err := runCLI(t, "", "topics", "rm", "nope")
+	if err == nil || !strings.Contains(err.Error(), "no such topic") {
+		t.Fatalf("got %v, want a no-such-topic error", err)
+	}
+}
+
+// Completion asks the daemon for topic names, and offers nothing (rather than
+// local filenames) when it can't reach one.
+func TestTopicCompletion(t *testing.T) {
+	store := startDaemon(t)
+	store.Append("review", "one", "")
+	store.Append("alerts", "boom", "")
+
+	for _, args := range [][]string{
+		{"topics", "rm", ""},
+		{"pub", ""},
+		{"sub", ""},
+		{"peek", ""},
+	} {
+		t.Run(args[0], func(t *testing.T) {
+			out, err := runCLI(t, "", append([]string{"__complete"}, args...)...)
+			if err != nil {
+				t.Fatalf("__complete: %v", err)
+			}
+			// sub also suggests its required --as flag, so look for the
+			// topics rather than expecting them to be the whole output.
+			if !strings.Contains(out, "\nalerts\nreview\n:4\n") && !strings.HasPrefix(out, "alerts\nreview\n:4\n") {
+				t.Fatalf("unexpected completions:\n%s", out)
+			}
+		})
+	}
+
+	// Only the topic argument completes; pub's message does not.
+	out, _ := runCLI(t, "", "__complete", "pub", "review", "")
+	if !strings.HasPrefix(out, ":4\n") {
+		t.Fatalf("pub message argument offered completions:\n%s", out)
+	}
+}
+
+func TestTopicCompletionWithoutDaemon(t *testing.T) {
+	out, err := runCLI(t, "", "__complete", "topics", "rm", "")
+	if err != nil {
+		t.Fatalf("__complete: %v", err)
+	}
+	if !strings.HasPrefix(out, ":4\n") {
+		t.Fatalf("unexpected completions without a daemon:\n%s", out)
 	}
 }

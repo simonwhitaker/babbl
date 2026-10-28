@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -150,6 +152,21 @@ func cursorFor(infos []TopicInfo, topic, sub string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// waitForCursor blocks until a subscriber parked in a goroutine has registered.
+func waitForCursor(t *testing.T, s *Store, topic, sub string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := cursorFor(s.Topics(), topic, sub); ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never registered on %s", sub, topic)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func TestStateSurvivesReopen(t *testing.T) {
@@ -300,5 +317,161 @@ func TestInvalidNamesRejected(t *testing.T) {
 		if _, _, err := s.Next(ctx, "review", bad, false); !errors.Is(err, ErrInvalidSubscriber) {
 			t.Errorf("Next(sub=%q): got %v, want ErrInvalidSubscriber", bad, err)
 		}
+	}
+}
+
+func TestDeleteRemovesTopicAndCursors(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	s.Append("review", "one", "")
+	s.Append("review", "two", "")
+	s.Append("alerts", "boom", "")
+	next(t, s, "review", "codex")
+	next(t, s, "review", "claude")
+
+	count, subs, err := s.Delete("review")
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if count != 2 || subs != 2 {
+		t.Fatalf("Delete reported %d messages, %d subscribers; want 2, 2", count, subs)
+	}
+
+	infos := s.Topics()
+	if len(infos) != 1 || infos[0].Name != "alerts" {
+		t.Fatalf("unexpected topics after delete: %+v", infos)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "topics", "review.jsonl")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("log file still present (stat err: %v)", err)
+	}
+
+	// The deletion is durable, not just in memory.
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if infos := s2.Topics(); len(infos) != 1 || infos[0].Name != "alerts" {
+		t.Fatalf("unexpected topics after reopen: %+v", infos)
+	}
+}
+
+// Reusing a deleted topic's name gives a brand-new topic.
+func TestPublishAfterDeleteStartsFresh(t *testing.T) {
+	s := newTestStore(t)
+	s.Append("review", "old", "")
+	next(t, s, "review", "codex")
+
+	if _, _, err := s.Delete("review"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	m, err := s.Append("review", "new", "")
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if m.ID != 0 {
+		t.Fatalf("first message after delete has ID %d, want 0", m.ID)
+	}
+	// codex's old cursor went with the topic, so it sees the new message.
+	if got, ok := next(t, s, "review", "codex"); !ok || got.Payload != "new" {
+		t.Fatalf("got %q (ok=%v), want %q", got.Payload, ok, "new")
+	}
+}
+
+func TestDeleteUnknownTopic(t *testing.T) {
+	s := newTestStore(t)
+	if _, _, err := s.Delete("nope"); !errors.Is(err, ErrTopicNotFound) {
+		t.Fatalf("got %v, want ErrTopicNotFound", err)
+	}
+	if _, _, err := s.Delete("has space"); !errors.Is(err, ErrInvalidTopic) {
+		t.Fatalf("got %v, want ErrInvalidTopic", err)
+	}
+}
+
+// A topic that has only ever been subscribed to shows up in Topics, so it must
+// be deletable too.
+func TestDeleteCursorOnlyTopic(t *testing.T) {
+	s := newTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	s.Next(ctx, "quiet", "codex", false)
+
+	count, subs, err := s.Delete("quiet")
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if count != 0 || subs != 1 {
+		t.Fatalf("Delete reported %d messages, %d subscribers; want 0, 1", count, subs)
+	}
+	if infos := s.Topics(); len(infos) != 0 {
+		t.Fatalf("topic survived delete: %+v", infos)
+	}
+}
+
+// A subscriber parked on a topic is woken by its deletion and told why, rather
+// than waiting on — and resurrecting — a topic nobody cares about any more.
+func TestDeleteWakesParkedSubscriber(t *testing.T) {
+	s := newTestStore(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		_, _, err := s.Next(ctx, "quiet", "codex", false)
+		errCh <- err
+	}()
+
+	// Wait for the subscriber to register before deleting out from under it.
+	waitForCursor(t, s, "quiet", "codex")
+
+	if _, _, err := s.Delete("quiet"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrTopicDeleted) {
+			t.Fatalf("parked Next returned %v, want ErrTopicDeleted", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked subscriber was not woken by delete")
+	}
+	if infos := s.Topics(); len(infos) != 0 {
+		t.Fatalf("deleted topic came back: %+v", infos)
+	}
+}
+
+// Deleting one topic must not disturb subscribers parked on another.
+func TestDeleteLeavesOtherSubscribersParked(t *testing.T) {
+	s := newTestStore(t)
+	s.Append("doomed", "x", "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got := make(chan string, 1)
+	go func() {
+		m, _, err := s.Next(ctx, "quiet", "codex", false)
+		if err != nil {
+			got <- "error: " + err.Error()
+			return
+		}
+		got <- m.Payload
+	}()
+
+	waitForCursor(t, s, "quiet", "codex")
+
+	s.Delete("doomed")
+	s.Append("quiet", "still listening", "")
+
+	select {
+	case p := <-got:
+		if p != "still listening" {
+			t.Fatalf("got %q, want %q", p, "still listening")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber on another topic never received its message")
 	}
 }

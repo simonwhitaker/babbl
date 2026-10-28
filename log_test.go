@@ -108,6 +108,50 @@ func TestLogRecordsPeekAndTopicsAndErrors(t *testing.T) {
 	}
 }
 
+func TestLogRecordsDelete(t *testing.T) {
+	c, out := newLoggingServer(t)
+	ctx := context.Background()
+
+	c.Publish(ctx, "review", "one", "")
+	c.Publish(ctx, "review", "two", "")
+	c.Next(ctx, "review", "codex", false)
+	if err := c.Delete(ctx, "review"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	lines := logLines(out)
+	want := `^\d\d:\d\d:\d\d rm \s+review\s+2 messages, 1 subscriber$`
+	if last := lines[len(lines)-1]; !regexp.MustCompile(want).MatchString(last) {
+		t.Fatalf("last line is %q, want match for %s", last, want)
+	}
+}
+
+// The rm line already explains why parked subscribers were dropped, so waking
+// them must not add an error line apiece.
+func TestLogSkipsSubscribersWokenByDelete(t *testing.T) {
+	var out syncBuffer
+	store := newTestStore(t)
+	srv := httptest.NewServer(NewServer(store, newEventLog(&out)))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL)
+
+	done := make(chan struct{})
+	go func() {
+		c.Next(context.Background(), "quiet", "codex", false)
+		close(done)
+	}()
+	waitForCursor(t, store, "quiet", "codex")
+	if err := c.Delete(context.Background(), "quiet"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	<-done
+
+	lines := logLines(&out)
+	if len(lines) != 1 || !strings.Contains(lines[0], "rm     quiet") {
+		t.Fatalf("want only the rm line, got:\n%s", &out)
+	}
+}
+
 // Names are logged before they are validated, so a topic or publisher carrying
 // terminal escapes must reach the log quoted.
 func TestLogQuotesHostileNames(t *testing.T) {

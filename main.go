@@ -198,8 +198,9 @@ multi-line content gets published.`,
 		Example: `  babbl pub review-comments 'fix nil deref in foo.go:42'
   babbl pub review-comments 'needs a test' --from claude
   git diff | babbl pub diffs`,
-		Args:    cobra.MinimumNArgs(1),
-		Aliases: []string{"publish"},
+		Args:              cobra.MinimumNArgs(1),
+		Aliases:           []string{"publish"},
+		ValidArgsFunction: completeTopic,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			topic := args[0]
 
@@ -261,8 +262,9 @@ Exit codes: 0 a message was printed, 3 timed out with nothing to deliver,
 
   # drain a topic, then stop once it goes quiet
   while babbl sub review-comments --as codex --timeout 5s; do :; done`,
-		Args:    cobra.ExactArgs(1),
-		Aliases: []string{"subscribe"},
+		Args:              cobra.ExactArgs(1),
+		Aliases:           []string{"subscribe"},
+		ValidArgsFunction: completeTopic,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := contextWithOptionalTimeout(cmd.Context(), timeout)
 			defer cancel()
@@ -297,10 +299,11 @@ func peekCmd() *cobra.Command {
 	var asJSON bool
 
 	cmd := &cobra.Command{
-		Use:     "peek <topic>",
-		Short:   "Read a topic without advancing any cursor",
-		Args:    cobra.ExactArgs(1),
-		Example: `  babbl peek review-comments --limit 5`,
+		Use:               "peek <topic>",
+		Short:             "Read a topic without advancing any cursor",
+		Args:              cobra.ExactArgs(1),
+		Example:           `  babbl peek review-comments --limit 5`,
+		ValidArgsFunction: completeTopic,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			msgs, err := NewClient(addr(cmd)).Peek(cmd.Context(), args[0], from, limit)
 			if err != nil {
@@ -324,10 +327,22 @@ func peekCmd() *cobra.Command {
 }
 
 func topicsCmd() *cobra.Command {
+	cmd := topicsListCmd("topics")
+	cmd.Short = "List and manage topics"
+	cmd.Long = `List topics with their message counts and subscriber cursors.
+
+With no subcommand, 'babbl topics' is the same as 'babbl topics ls'.`
+	cmd.AddCommand(topicsListCmd("ls"), topicsRmCmd())
+	return cmd
+}
+
+// topicsListCmd builds the listing command. It is used twice: as the bare
+// `topics` parent, and as its explicit `ls` subcommand.
+func topicsListCmd(use string) *cobra.Command {
 	var asJSON bool
 
 	cmd := &cobra.Command{
-		Use:   "topics",
+		Use:   use,
 		Short: "List topics with message counts and subscriber cursors",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -356,6 +371,43 @@ func topicsCmd() *cobra.Command {
 
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
 	return cmd
+}
+
+func topicsRmCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "rm <topic>",
+		Short: "Delete a topic, its messages, and its subscriber cursors",
+		Long: `Delete a topic, its messages, and its subscriber cursors.
+
+Subscribers blocked on the topic are woken with an error. Publishing to the
+same name afterwards starts a new, empty topic.`,
+		Example:           `  babbl topics rm review-comments`,
+		Args:              cobra.ExactArgs(1),
+		Aliases:           []string{"delete"},
+		ValidArgsFunction: completeTopic,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return NewClient(addr(cmd)).Delete(cmd.Context(), args[0])
+		},
+	}
+}
+
+// completeTopic completes the topic argument from the running daemon. Without
+// one it offers nothing, rather than falling back to local filenames.
+func completeTopic(cmd *cobra.Command, args []string, _ string) ([]string, cobra.ShellCompDirective) {
+	if len(args) > 0 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	ctx, cancel := context.WithTimeout(cmd.Context(), time.Second)
+	defer cancel()
+	infos, err := NewClient(addr(cmd)).Topics(ctx)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	names := make([]string, len(infos))
+	for i, info := range infos {
+		names[i] = info.Name
+	}
+	return names, cobra.ShellCompDirectiveNoFileComp
 }
 
 func plural(n int, word string) string {

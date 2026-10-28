@@ -90,7 +90,11 @@ func NewServer(s *Store, log *eventLog) http.Handler {
 
 		m, ok, err := s.Next(ctx, topic, subscriber, q.Get("from") == "latest")
 		if err != nil {
-			log.event("error", topic, err.Error())
+			// A subscriber dropped by a delete is accounted for by the rm
+			// line, so don't log one error per waiter on top of it.
+			if !errors.Is(err, ErrTopicDeleted) {
+				log.event("error", topic, err.Error())
+			}
 			writeStoreError(w, err)
 			return
 		}
@@ -127,6 +131,19 @@ func NewServer(s *Store, log *eventLog) http.Handler {
 		writeJSON(w, http.StatusOK, msgs)
 	})
 
+	mux.HandleFunc("DELETE /topics/{topic}", func(w http.ResponseWriter, r *http.Request) {
+		topic := r.PathValue("topic")
+		count, subs, err := s.Delete(topic)
+		if err != nil {
+			log.event("error", topic, err.Error())
+			writeStoreError(w, err)
+			return
+		}
+		log.event("rm", topic, fmt.Sprintf("%d %s, %d %s",
+			count, plural(count, "message"), subs, plural(subs, "subscriber")))
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	return mux
 }
 
@@ -150,9 +167,14 @@ func writeError(w http.ResponseWriter, status int, err error) {
 }
 
 func writeStoreError(w http.ResponseWriter, err error) {
-	if errors.Is(err, ErrInvalidTopic) || errors.Is(err, ErrInvalidSubscriber) {
+	switch {
+	case errors.Is(err, ErrInvalidTopic) || errors.Is(err, ErrInvalidSubscriber):
 		writeError(w, http.StatusBadRequest, err)
-		return
+	case errors.Is(err, ErrTopicNotFound):
+		writeError(w, http.StatusNotFound, err)
+	case errors.Is(err, ErrTopicDeleted):
+		writeError(w, http.StatusGone, err)
+	default:
+		writeError(w, http.StatusInternalServerError, err)
 	}
-	writeError(w, http.StatusInternalServerError, err)
 }

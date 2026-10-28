@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -183,5 +184,72 @@ func TestServerRejectsBadRequests(t *testing.T) {
 				t.Fatalf("got %s, want 400", resp.Status)
 			}
 		})
+	}
+}
+
+func TestServerDelete(t *testing.T) {
+	c, store := newTestServer(t)
+	ctx := context.Background()
+
+	c.Publish(ctx, "review", "one", "")
+	if err := c.Delete(ctx, "review"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if infos := store.Topics(); len(infos) != 0 {
+		t.Fatalf("topic survived delete: %+v", infos)
+	}
+}
+
+func TestServerDeleteStatusCodes(t *testing.T) {
+	store := newTestStore(t)
+	store.Append("review", "one", "")
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	cases := []struct {
+		topic string
+		want  int
+	}{
+		{"review", http.StatusNoContent},
+		{"review", http.StatusNotFound}, // already gone
+		{"has%20space", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/topics/"+tc.topic, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("DELETE %s: %v", tc.topic, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("DELETE %s: got %s, want %d", tc.topic, resp.Status, tc.want)
+		}
+	}
+}
+
+// A CLI subscriber blocked on a topic gets an error, not a silent re-poll, when
+// that topic is deleted.
+func TestServerDeleteWakesBlockedClient(t *testing.T) {
+	c, store := newTestServer(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		_, _, err := c.Next(ctx, "quiet", "codex", false)
+		errCh <- err
+	}()
+	waitForCursor(t, store, "quiet", "codex")
+
+	if err := c.Delete(context.Background(), "quiet"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	select {
+	case err := <-errCh:
+		if err == nil || !strings.Contains(err.Error(), "deleted") {
+			t.Fatalf("blocked Next returned %v, want a topic-deleted error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked client was not woken by delete")
 	}
 }

@@ -111,6 +111,26 @@ func (c *Client) Topics(ctx context.Context) ([]TopicInfo, error) {
 	return infos, c.getJSON(ctx, c.baseURL+"/topics", &infos)
 }
 
+func (c *Client) Delete(ctx context.Context, topic string) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	u := fmt.Sprintf("%s/topics/%s", c.baseURL, url.PathEscape(topic))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return connError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return httpError(resp)
+	}
+	return nil
+}
+
 func (c *Client) getJSON(ctx context.Context, u string, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()

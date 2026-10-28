@@ -39,6 +39,13 @@ var topicNameRE = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 // filename. We reject rather than escape, so the on-disk layout stays readable.
 var ErrInvalidTopic = errors.New("invalid topic name: must match [A-Za-z0-9._-]+")
 
+// ErrTopicNotFound is returned when deleting a topic that doesn't exist.
+var ErrTopicNotFound = errors.New("no such topic")
+
+// ErrTopicDeleted is returned to a subscriber whose topic was deleted while it
+// was waiting on it.
+var ErrTopicDeleted = errors.New("topic deleted")
+
 // ErrInvalidSubscriber is returned for empty or malformed subscriber names.
 var ErrInvalidSubscriber = errors.New("invalid subscriber name: must match [A-Za-z0-9._-]+")
 
@@ -72,6 +79,11 @@ type Store struct {
 	mu      sync.Mutex
 	topics  map[string][]Message
 	cursors map[string]map[string]int
+	// deletions counts how many times each topic has been deleted. A waiter
+	// notes the count before parking and gives up if it has moved on waking,
+	// so deleting a topic stops its subscribers instead of leaving them to
+	// re-register and bring it back.
+	deletions map[string]int
 	// notify is closed and replaced on every append, waking all long-poll
 	// waiters at once. Waiters take a reference under the lock, release it,
 	// then select on the channel.
@@ -81,10 +93,11 @@ type Store struct {
 // Open loads any existing state from dir, creating it if necessary.
 func Open(dir string) (*Store, error) {
 	s := &Store{
-		dir:     dir,
-		topics:  map[string][]Message{},
-		cursors: map[string]map[string]int{},
-		notify:  make(chan struct{}),
+		dir:       dir,
+		topics:    map[string][]Message{},
+		cursors:   map[string]map[string]int{},
+		deletions: map[string]int{},
+		notify:    make(chan struct{}),
 	}
 	if err := os.MkdirAll(s.topicsDir(), 0o755); err != nil {
 		return nil, fmt.Errorf("creating state dir: %w", err)
@@ -209,9 +222,15 @@ func (s *Store) Append(topic, payload, from string) (Message, error) {
 	}
 	s.topics[topic] = append(s.topics[topic], m)
 
+	s.wake()
+	return m, nil
+}
+
+// wake releases every long-poll waiter so it re-checks its topic. Caller must
+// hold s.mu.
+func (s *Store) wake() {
 	close(s.notify)
 	s.notify = make(chan struct{})
-	return m, nil
 }
 
 // appendToLog persists one message. Caller must hold s.mu.
@@ -249,8 +268,16 @@ func (s *Store) Next(ctx context.Context, topic, subscriber string, fromLatest b
 		return Message{}, false, err
 	}
 
+	s.mu.Lock()
+	deletions := s.deletions[topic]
+	s.mu.Unlock()
+
 	for {
 		s.mu.Lock()
+		if s.deletions[topic] != deletions {
+			s.mu.Unlock()
+			return Message{}, false, ErrTopicDeleted
+		}
 		msgs := s.topics[topic]
 		subs, ok := s.cursors[topic]
 		if !ok {
@@ -320,6 +347,46 @@ func (s *Store) Peek(topic string, from, limit int) ([]Message, error) {
 	out := make([]Message, end-from)
 	copy(out, msgs[from:end])
 	return out, nil
+}
+
+// Delete removes a topic's log and every subscriber cursor on it, reporting how
+// many messages and subscribers it had. Subscribers waiting on the topic are
+// woken with ErrTopicDeleted. Publishing to the name afterwards starts a new
+// topic from ID 0.
+//
+// Cursors are removed before the log, so a crash in between leaves the topic's
+// messages without cursors — still listed, and still deletable — rather than
+// leaving cursors that point past the end of a topic that is later recreated.
+func (s *Store) Delete(topic string) (messages, subscribers int, err error) {
+	if err := validTopic(topic); err != nil {
+		return 0, 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	msgs, hasLog := s.topics[topic]
+	subs, hasCursors := s.cursors[topic]
+	if !hasLog && !hasCursors {
+		return 0, 0, ErrTopicNotFound
+	}
+
+	if hasCursors {
+		delete(s.cursors, topic)
+		if err := s.saveCursors(); err != nil {
+			s.cursors[topic] = subs
+			return 0, 0, err
+		}
+	}
+	// Bump the deletion count before anything else can fail, so waiters stop
+	// even if the log can't be removed: their cursors are already gone.
+	s.deletions[topic]++
+	s.wake()
+
+	if err := os.Remove(s.topicPath(topic)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return 0, 0, fmt.Errorf("removing topic log: %w", err)
+	}
+	delete(s.topics, topic)
+	return len(msgs), len(subs), nil
 }
 
 // Topics lists every known topic, sorted by name.

@@ -77,6 +77,16 @@ babbl peek review-comments
 babbl topics
 ```
 
+Delete a topic you no longer need, along with its messages and cursors:
+
+```sh
+babbl topics rm review-comments
+```
+
+Any subscriber blocked on it is woken with an error (exit 1), so a
+`while babbl sub …` loop on that topic stops too. Publishing to the same name
+afterwards starts a new topic from `#0`.
+
 ## Watching traffic
 
 `serve --verbose` prints a line to stderr as each message is published and
@@ -134,7 +144,8 @@ babbl serve [--addr ADDR] [--dir PATH] [--verbose]
 babbl pub <topic> [message] [--from NAME] [--json]
 babbl sub <topic> --as NAME [--timeout D] [--latest] [--json]
 babbl peek <topic> [--from N] [--limit N] [--json]
-babbl topics [--json]
+babbl topics [ls] [--json]
+babbl topics rm <topic>
 ```
 
 `babbl help <command>` or `babbl <command> --help` documents each one.
@@ -148,7 +159,7 @@ babbl pub notes -- '--this is not a flag'
 
 Topic and subscriber names must match `[A-Za-z0-9._-]+`.
 
-Shell completions:
+Shell completions (topic names are completed from the running daemon):
 
 ```sh
 babbl completion fish > ~/.config/fish/completions/babbl.fish
@@ -178,20 +189,21 @@ docker run -d -p 127.0.0.1:8787:8787 -v babbl-state:/var/lib/babbl babbl
 <dir>/cursors.json           {"review-comments": {"codex": 3, "claude": 0}}
 ```
 
-Both are plain text, so `cat` and `jq` work fine for debugging, and deleting a
-topic file or editing a cursor by hand does what you would expect (after a
-daemon restart).
+Both are plain text, so `cat` and `jq` work fine for debugging. Use
+`babbl topics rm` to delete a topic while the daemon is running; editing a cursor
+by hand does what you would expect after a daemon restart.
 
 ## HTTP API
 
 The CLI is a thin client over an HTTP API, so `curl` works too:
 
 ```
-POST /topics/{topic}                              body is the raw payload
-GET  /topics/{topic}/next?as=NAME&wait=30s        long-poll; 200 + message, or 204
-GET  /topics/{topic}?from=0&limit=50              peek, no cursor change
-GET  /topics                                      list topics and cursors
-GET  /healthz
+POST   /topics/{topic}                            body is the raw payload
+GET    /topics/{topic}/next?as=NAME&wait=30s      long-poll; 200 + message, 204, or 410 if deleted
+GET    /topics/{topic}?from=0&limit=50            peek, no cursor change
+GET    /topics                                    list topics and cursors
+DELETE /topics/{topic}                            delete; 204, or 404 if unknown
+GET    /healthz
 ```
 
 ## Not implemented
