@@ -71,9 +71,9 @@ func TestLogSkipsEmptyLongPolls(t *testing.T) {
 	srv := httptest.NewServer(NewServer(newTestStore(t), newEventLog(&out)))
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/topics/quiet/next?as=codex&wait=1ms")
+	resp, err := http.Post(srv.URL+"/topics/quiet/next?as=codex&wait=1ms", "", nil)
 	if err != nil {
-		t.Fatalf("GET: %v", err)
+		t.Fatalf("POST: %v", err)
 	}
 	resp.Body.Close()
 
@@ -89,7 +89,7 @@ func TestLogRecordsPeekAndTopicsAndErrors(t *testing.T) {
 	c.Publish(ctx, "review", "one", "")
 	c.Peek(ctx, "review", 0, 50)
 	c.Topics(ctx)
-	http.Get(c.baseURL + "/topics/review/next") // 400: no ?as=
+	http.Post(c.baseURL+"/topics/review/next", "", nil) // 400: no ?as=
 
 	want := []string{
 		"pub    review#0",
@@ -159,7 +159,7 @@ func TestLogQuotesHostileNames(t *testing.T) {
 	ctx := context.Background()
 
 	c.Publish(ctx, "review", "hi", "\x1b[31mclaude")
-	http.Get(c.baseURL + "/topics/%1b%5b31mreview/next?as=codex")
+	http.Post(c.baseURL+"/topics/%1b%5b31mreview/next?as=codex", "", nil)
 
 	got := out.String()
 	if strings.ContainsRune(got, 0x1b) {

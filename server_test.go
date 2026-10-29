@@ -61,9 +61,9 @@ func TestServerLongPollReturns204(t *testing.T) {
 	srv := httptest.NewServer(NewServer(store, nil))
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/topics/quiet/next?as=codex&wait=100ms")
+	resp, err := http.Post(srv.URL+"/topics/quiet/next?as=codex&wait=100ms", "", nil)
 	if err != nil {
-		t.Fatalf("GET: %v", err)
+		t.Fatalf("POST: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
@@ -175,9 +175,9 @@ func TestServerRejectsBadRequests(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, err := http.Get(srv.URL + tc.url)
+			resp, err := http.Post(srv.URL+tc.url, "", nil)
 			if err != nil {
-				t.Fatalf("GET: %v", err)
+				t.Fatalf("POST: %v", err)
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusBadRequest {
@@ -251,5 +251,218 @@ func TestServerDeleteWakesBlockedClient(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("blocked client was not woken by delete")
+	}
+}
+
+// A DNS-rebinding page reaches the daemon under its own hostname, so anything
+// other than localhost or an IP literal is refused, on every route.
+func TestServerRejectsForeignHost(t *testing.T) {
+	store := newTestStore(t)
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	for _, path := range []string{"/topics", "/topics/review", "/healthz"} {
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+path, nil)
+		req.Host = "rebind.evil.example:8787"
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("GET %s with foreign Host: got %s, want 403", path, resp.Status)
+		}
+	}
+}
+
+func TestLoopbackHost(t *testing.T) {
+	for host, want := range map[string]bool{
+		"127.0.0.1:8787":   true,
+		"127.0.0.1":        true,
+		"localhost:8787":   true,
+		"LOCALHOST":        true,
+		"localhost.:8787":  true,
+		"[::1]:8787":       true,
+		"[::1]":            true,
+		"10.0.0.5:8787":    true, // Docker or LAN binds; rebinding never yields an IP
+		"":                 false,
+		"evil.example":     false,
+		"evil.example:80":  false,
+		"localhost.evil":   false,
+		"127.0.0.1.nip.io": false,
+	} {
+		if got := loopbackHost(host); got != want {
+			t.Errorf("loopbackHost(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
+// A web page can POST text/plain or send a DELETE to localhost. Browsers mark
+// those with Sec-Fetch-Site or Origin, and the server refuses them.
+func TestServerRejectsCrossOriginWrites(t *testing.T) {
+	store := newTestStore(t)
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	store.Append("review", "keep me", "")
+
+	for _, tc := range []struct {
+		name, method, header, value string
+	}{
+		{"POST cross-site", http.MethodPost, "Sec-Fetch-Site", "cross-site"},
+		{"POST foreign Origin", http.MethodPost, "Origin", "https://evil.example"},
+		{"DELETE cross-site", http.MethodDelete, "Sec-Fetch-Site", "cross-site"},
+	} {
+		req, _ := http.NewRequest(tc.method, srv.URL+"/topics/review?from=claude", strings.NewReader("injected"))
+		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
+		req.Header.Set(tc.header, tc.value)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s: got %s, want 403", tc.name, resp.Status)
+		}
+	}
+
+	msgs, _ := store.Peek("review", 0, 0)
+	if len(msgs) != 1 || msgs[0].Payload != "keep me" {
+		t.Fatalf("topic changed by rejected requests: %+v", msgs)
+	}
+}
+
+// curl, the CLI and a page on the daemon's own origin are all still allowed.
+func TestServerAllowsSameOriginAndNonBrowserWrites(t *testing.T) {
+	store := newTestStore(t)
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	for _, h := range []map[string]string{
+		{},
+		{"Sec-Fetch-Site": "same-origin"},
+		{"Origin": srv.URL},
+	} {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/topics/review", strings.NewReader("hello"))
+		for k, v := range h {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST with %v: %v", h, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Errorf("POST with %v: got %s, want 201", h, resp.Status)
+		}
+	}
+}
+
+// A page can't read a cross-origin response, but it doesn't need to: asking
+// for the next message advances the cursor, and delivery is at-most-once.
+// Neither method may be used to consume a message from another site.
+func TestServerRejectsCrossOriginNext(t *testing.T) {
+	store := newTestStore(t)
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	store.Append("review", "keep me", "")
+
+	for _, tc := range []struct {
+		name, method, header, value string
+	}{
+		{"POST cross-site", http.MethodPost, "Sec-Fetch-Site", "cross-site"},
+		{"POST foreign Origin", http.MethodPost, "Origin", "https://evil.example"},
+		{"GET cross-site", http.MethodGet, "Sec-Fetch-Site", "cross-site"},
+		{"GET same-site", http.MethodGet, "Sec-Fetch-Site", "same-site"},
+		{"GET foreign Origin", http.MethodGet, "Origin", "https://evil.example"},
+		{"GET opaque Origin", http.MethodGet, "Origin", "null"},
+	} {
+		req, _ := http.NewRequest(tc.method, srv.URL+"/topics/review/next?as=codex&wait=0s", nil)
+		req.Header.Set(tc.header, tc.value)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s: got %s, want 403", tc.name, resp.Status)
+		}
+	}
+
+	if cursors := store.Topics()[0].Cursors; len(cursors) != 0 {
+		t.Fatalf("rejected requests registered a subscriber: %v", cursors)
+	}
+}
+
+// The GET form survives for clients from before the switch to POST, and for
+// curl. Without browser headers it still delivers.
+func TestServerNextStillServesGET(t *testing.T) {
+	store := newTestStore(t)
+	srv := httptest.NewServer(NewServer(store, nil))
+	defer srv.Close()
+
+	store.Append("review", "one", "")
+	store.Append("review", "two", "")
+
+	for _, h := range []map[string]string{
+		{},
+		{"Sec-Fetch-Site": "none"},
+	} {
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/topics/review/next?as=codex&wait=0s", nil)
+		for k, v := range h {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET with %v: %v", h, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET with %v: got %s, want 200", h, resp.Status)
+		}
+	}
+}
+
+// A daemon left running from an older release only routes GET for next, so
+// the client falls back to it when POST is refused.
+func TestClientNextFallsBackToGET(t *testing.T) {
+	var methods []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /topics/{topic}/next", func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		writeJSON(w, http.StatusOK, Message{Topic: "review", Payload: "hello"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	m, ok, err := NewClient(srv.URL).Next(context.Background(), "review", "codex", false)
+	if err != nil || !ok || m.Payload != "hello" {
+		t.Fatalf("Next: %+v (ok=%v, err=%v)", m, ok, err)
+	}
+	if len(methods) != 1 {
+		t.Fatalf("old server saw %v, want a single GET after the refused POST", methods)
+	}
+}
+
+// The client uses POST against a current daemon, so it gets the stricter check.
+func TestClientNextUsesPOST(t *testing.T) {
+	var methods []string
+	inner := NewServer(newTestStore(t), nil)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		inner.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL)
+	ctx := context.Background()
+
+	c.Publish(ctx, "review", "hello", "")
+	methods = nil
+	if _, ok, err := c.Next(ctx, "review", "codex", false); err != nil || !ok {
+		t.Fatalf("Next: ok=%v, err=%v", ok, err)
+	}
+	if len(methods) != 1 || methods[0] != http.MethodPost {
+		t.Fatalf("client sent %v, want [POST]", methods)
 	}
 }
