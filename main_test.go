@@ -157,6 +157,17 @@ func TestWrongArgCounts(t *testing.T) {
 	}
 }
 
+// A bad --allow-host would otherwise allow nothing and leave the user puzzling
+// over 403s, so serve refuses it before opening state or listening.
+func TestServeRejectsBadAllowHost(t *testing.T) {
+	for _, bad := range []string{"*", "http://babbl:8787", ""} {
+		_, err := runCLI(t, "", "serve", "--dir", t.TempDir(), "--addr", "127.0.0.1:0", "--allow-host", bad)
+		if err == nil || !strings.Contains(err.Error(), "--allow-host") {
+			t.Errorf("--allow-host %q: got %v, want an --allow-host error", bad, err)
+		}
+	}
+}
+
 // --help must exit cleanly and advertise GNU-style double-dash flags.
 func TestHelpIsCleanAndUsesDoubleDashes(t *testing.T) {
 	for _, args := range [][]string{{"pub", "--help"}, {"sub", "--help"}, {"--help"}} {

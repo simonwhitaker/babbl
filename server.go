@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -25,8 +26,9 @@ const defaultWait = 30 * time.Second
 const maxPayload = 1 << 20
 
 // NewServer builds the HTTP handler for a store. A nil log disables the
-// request log; see eventLog.
-func NewServer(s *Store, log *eventLog) http.Handler {
+// request log; see eventLog. allowHosts are extra Host names to accept beyond
+// localhost and IP literals; see guard.
+func NewServer(s *Store, log *eventLog, allowHosts ...string) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -160,7 +162,7 @@ func NewServer(s *Store, log *eventLog) http.Handler {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	return guard(mux, log)
+	return guard(mux, log, allowHosts)
 }
 
 // guard keeps web pages out of the API. babbl has no auth, so without it any
@@ -171,11 +173,18 @@ func NewServer(s *Store, log *eventLog) http.Handler {
 // hostname, so only loopback names and IP literals are accepted. The port is
 // ignored, since Docker may publish the daemon on a different one. IP literals
 // are allowed so the daemon stays reachable on whatever address it is bound to.
+// allowHosts adds names on top, such as a Compose service name; they must
+// already have been through validHostName.
 //
 // CrossOriginProtection rejects cross-site POST and DELETE, which a page can
 // otherwise send without a preflight. The CLI sends neither Origin nor
 // Sec-Fetch-Site, so it is unaffected.
-func guard(h http.Handler, log *eventLog) http.Handler {
+func guard(h http.Handler, log *eventLog, allowHosts []string) http.Handler {
+	allowed := map[string]bool{"localhost": true}
+	for _, name := range allowHosts {
+		allowed[hostName(name)] = true
+	}
+
 	cop := http.NewCrossOriginProtection()
 	cop.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.event("error", "", "cross-origin request rejected: "+safe(r.Header.Get("Origin")))
@@ -184,7 +193,7 @@ func guard(h http.Handler, log *eventLog) http.Handler {
 	h = cop.Handler(h)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !loopbackHost(r.Host) {
+		if host := hostName(r.Host); !allowed[host] && net.ParseIP(host) == nil {
 			log.event("error", "", "unexpected Host header: "+safe(r.Host))
 			writeError(w, http.StatusForbidden, errors.New("unexpected Host header: "+r.Host))
 			return
@@ -209,15 +218,24 @@ func crossSiteBrowser(r *http.Request) bool {
 	return err != nil || u.Host != r.Host
 }
 
-// loopbackHost reports whether a Host header names localhost or an IP literal,
-// with or without a port.
-func loopbackHost(hostport string) bool {
+// hostName reduces a Host header, or an --allow-host value, to the bare name
+// it is compared on: no port, no IPv6 brackets, no trailing dot, lower case.
+func hostName(hostport string) string {
 	host := hostport
 	if h, _, err := net.SplitHostPort(hostport); err == nil {
 		host = h
 	}
-	host = strings.TrimSuffix(strings.Trim(host, "[]"), ".")
-	return strings.EqualFold(host, "localhost") || net.ParseIP(host) != nil
+	return strings.ToLower(strings.TrimSuffix(strings.Trim(host, "[]"), "."))
+}
+
+// hostNameRE matches a DNS name with an optional trailing dot and port.
+var hostNameRE = regexp.MustCompile(`(?i)^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\.?(:[0-9]+)?$`)
+
+// validHostName reports whether an --allow-host value is a plain DNS name. It
+// catches the mistakes that would otherwise silently allow nothing, like a URL
+// or a "*" wildcard, which isn't supported.
+func validHostName(name string) bool {
+	return hostNameRE.MatchString(name)
 }
 
 // field renders an optional key=value detail, or "" if the value is unset.

@@ -275,24 +275,66 @@ func TestServerRejectsForeignHost(t *testing.T) {
 	}
 }
 
-func TestLoopbackHost(t *testing.T) {
-	for host, want := range map[string]bool{
-		"127.0.0.1:8787":   true,
-		"127.0.0.1":        true,
-		"localhost:8787":   true,
-		"LOCALHOST":        true,
-		"localhost.:8787":  true,
-		"[::1]:8787":       true,
-		"[::1]":            true,
-		"10.0.0.5:8787":    true, // Docker or LAN binds; rebinding never yields an IP
-		"":                 false,
-		"evil.example":     false,
-		"evil.example:80":  false,
-		"localhost.evil":   false,
-		"127.0.0.1.nip.io": false,
+// Without --allow-host, only localhost and IP literals get through.
+func TestServerHostCheck(t *testing.T) {
+	cases := []struct {
+		host  string
+		allow []string
+		want  int
+	}{
+		{"127.0.0.1:8787", nil, http.StatusOK},
+		{"127.0.0.1", nil, http.StatusOK},
+		{"localhost:8787", nil, http.StatusOK},
+		{"LOCALHOST", nil, http.StatusOK},
+		{"localhost.:8787", nil, http.StatusOK},
+		{"[::1]:8787", nil, http.StatusOK},
+		{"10.0.0.5:8787", nil, http.StatusOK}, // Docker or LAN binds; rebinding never yields an IP
+		{"evil.example", nil, http.StatusForbidden},
+		{"localhost.evil", nil, http.StatusForbidden},
+		{"127.0.0.1.nip.io", nil, http.StatusForbidden},
+		{"babbl:8787", nil, http.StatusForbidden},
+
+		// --allow-host adds names; port, case and a trailing dot don't matter.
+		{"babbl:8787", []string{"babbl"}, http.StatusOK},
+		{"BABBL.:9000", []string{"babbl"}, http.StatusOK},
+		{"babbl", []string{"Babbl:8787"}, http.StatusOK},
+		{"babbl.internal", []string{"babbl", "babbl.internal"}, http.StatusOK},
+		{"localhost", []string{"babbl"}, http.StatusOK},
+		{"sub.babbl:8787", []string{"babbl"}, http.StatusForbidden}, // exact names only
+		{"evil.example", []string{"babbl"}, http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		srv := httptest.NewServer(NewServer(newTestStore(t), nil, tc.allow...))
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/healthz", nil)
+		req.Host = tc.host
+		resp, err := http.DefaultClient.Do(req)
+		srv.Close()
+		if err != nil {
+			t.Fatalf("Host %q: %v", tc.host, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("Host %q, allow %q: got %d, want %d", tc.host, tc.allow, resp.StatusCode, tc.want)
+		}
+	}
+}
+
+func TestValidHostName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"babbl":          true,
+		"babbl.internal": true,
+		"Babbl:8787":     true,
+		"my-babbl.":      true,
+		"":               false,
+		"*":              false,
+		"*.internal":     false,
+		"http://babbl":   false,
+		"babbl/":         false,
+		"-babbl":         false,
+		"bab bl":         false,
 	} {
-		if got := loopbackHost(host); got != want {
-			t.Errorf("loopbackHost(%q) = %v, want %v", host, got, want)
+		if got := validHostName(name); got != want {
+			t.Errorf("validHostName(%q) = %v, want %v", name, got, want)
 		}
 	}
 }
