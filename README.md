@@ -182,6 +182,12 @@ docker run -d -p 127.0.0.1:8787:8787 -v babbl-state:/var/lib/babbl babbl
 
 `docker compose up -d` does this for you.
 
+The daemon only answers requests addressed to `localhost` or an IP address (see
+[HTTP API](#http-api)). To reach it by another name, such as from another
+container, allow that name with `--allow-host`; repeat it for several names. The
+Compose file allows its service name, so other services can use
+`http://babbl:8787`.
+
 ## On-disk format
 
 ```
@@ -199,12 +205,22 @@ The CLI is a thin client over an HTTP API, so `curl` works too:
 
 ```
 POST   /topics/{topic}                            body is the raw payload
-GET    /topics/{topic}/next?as=NAME&wait=30s      long-poll; 200 + message, 204, or 410 if deleted
+POST   /topics/{topic}/next?as=NAME&wait=30s      long-poll; 200 + message, 204, or 410 if deleted
 GET    /topics/{topic}?from=0&limit=50            peek, no cursor change
 GET    /topics                                    list topics and cursors
 DELETE /topics/{topic}                            delete; 204, or 404 if unknown
 GET    /healthz
 ```
+
+To keep web pages out, the daemon refuses (with 403) any request whose `Host`
+isn't `localhost`, an IP address, or a name passed to `serve --allow-host`, which
+defeats DNS rebinding. It also refuses
+cross-site `POST` and `DELETE` requests from browsers. `curl` and the CLI are
+unaffected.
+
+`next` moves a cursor, which is why it is a `POST`. `GET` still works for
+clients from older releases, but refuses any request a browser marks as
+cross-site.
 
 ## Not implemented
 

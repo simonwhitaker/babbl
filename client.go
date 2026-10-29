@@ -65,11 +65,14 @@ func (c *Client) Next(ctx context.Context, topic, subscriber string, fromLatest 
 	}
 	u := fmt.Sprintf("%s/topics/%s/next?%s", c.baseURL, url.PathEscape(topic), q.Encode())
 
+	// A daemon started from an older release only serves GET, and one left
+	// running across an upgrade is common, so fall back to that on a 405.
+	method := http.MethodPost
 	for {
 		if err := ctx.Err(); err != nil {
 			return Message{}, false, nil
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		req, err := http.NewRequestWithContext(ctx, method, u, nil)
 		if err != nil {
 			return Message{}, false, err
 		}
@@ -83,6 +86,11 @@ func (c *Client) Next(ctx context.Context, topic, subscriber string, fromLatest 
 		if resp.StatusCode == http.StatusNoContent {
 			resp.Body.Close()
 			continue // server-side wait elapsed; ask again.
+		}
+		if resp.StatusCode == http.StatusMethodNotAllowed && method == http.MethodPost {
+			resp.Body.Close()
+			method = http.MethodGet
+			continue
 		}
 		if resp.StatusCode != http.StatusOK {
 			err := httpError(resp)

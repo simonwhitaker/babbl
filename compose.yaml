@@ -3,7 +3,8 @@ name: babbl
 services:
   babbl:
     build: .
-    command: ["serve", "--addr", "0.0.0.0:8787", "--verbose"]
+    # --allow-host lets other services on this network use http://babbl:8787.
+    command: ["serve", "--addr", "0.0.0.0:8787", "--allow-host", "babbl", "--verbose"]
     # Published on loopback only: babbl has no auth and isn't meant to face a
     # network. The container binds 0.0.0.0; this is what limits exposure.
     ports:

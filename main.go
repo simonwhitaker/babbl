@@ -115,6 +115,7 @@ func addrFromEnv() string {
 func serveCmd() *cobra.Command {
 	var dir string
 	var verbose bool
+	var allowHosts []string
 
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -123,6 +124,12 @@ func serveCmd() *cobra.Command {
 
 Binds to loopback only and has no authentication; it is not meant to be exposed
 to a network.
+
+To keep web pages out, requests must address the daemon as localhost or by IP
+address. --allow-host accepts another name as well, such as a Compose service
+name that other containers use to reach it:
+
+  babbl serve --addr 0.0.0.0:8787 --allow-host babbl
 
 --verbose prints a line to stderr as each message is published, delivered, or
 peeked at:
@@ -134,6 +141,12 @@ Subscribers waiting on an empty topic are not logged; they re-poll on a timer
 and would drown out everything else.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			for _, h := range allowHosts {
+				if !validHostName(h) {
+					return fmt.Errorf("--allow-host %q: want a host name such as babbl or babbl.internal", h)
+				}
+			}
+
 			d := dir
 			if d == "" {
 				var err error
@@ -155,7 +168,7 @@ and would drown out everything else.`,
 			if verbose {
 				log = newEventLog(cmd.ErrOrStderr())
 			}
-			srv := &http.Server{Handler: NewServer(store, log)}
+			srv := &http.Server{Handler: NewServer(store, log, allowHosts...)}
 			fmt.Fprintf(os.Stderr, "babbl serving on %s (state: %s)\n", ln.Addr(), d)
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
@@ -181,6 +194,7 @@ and would drown out everything else.`,
 
 	cmd.Flags().StringVar(&dir, "dir", "", "state directory [$BABBL_DIR] (default $XDG_STATE_HOME/babbl, else ~/.local/state/babbl)")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "log each message as it is published and delivered")
+	cmd.Flags().StringArrayVar(&allowHosts, "allow-host", nil, "also accept requests addressed to this host name (repeatable)")
 	return cmd
 }
 
