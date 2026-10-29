@@ -174,7 +174,9 @@ babbl completion fish > ~/.config/fish/completions/babbl.fish
 | `BABBL_DIR`  | `$XDG_STATE_HOME/babbl`, else `~/.local/state/babbl` | State directory (also `--dir`) |
 
 The daemon binds to loopback only and has no authentication — it is not meant to
-be exposed to a network. Under Docker, publish the port on loopback:
+be exposed to a network. On a machine shared with other users, bear in mind that
+any of them can connect to the port, and so read and publish messages. Under
+Docker, publish the port on loopback:
 
 ```sh
 docker run -d -p 127.0.0.1:8787:8787 -v babbl-state:/var/lib/babbl babbl
@@ -195,7 +197,10 @@ Compose file allows its service name, so other services can use
 <dir>/cursors.json           {"review-comments": {"codex": 3, "claude": 0}}
 ```
 
-Both are plain text, so `cat` and `jq` work fine for debugging. Use
+Both are plain text, so `cat` and `jq` work fine for debugging. They are
+readable by your user alone: the daemon creates the state directory `0700` and
+its files `0600`, and on startup tightens any that are more open, such as state
+from older releases. Use
 `babbl topics rm` to delete a topic while the daemon is running; editing a cursor
 by hand does what you would expect after a daemon restart.
 

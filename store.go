@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -99,8 +100,11 @@ func Open(dir string) (*Store, error) {
 		deletions: map[string]int{},
 		notify:    make(chan struct{}),
 	}
-	if err := os.MkdirAll(s.topicsDir(), 0o755); err != nil {
+	if err := os.MkdirAll(s.topicsDir(), 0o700); err != nil {
 		return nil, fmt.Errorf("creating state dir: %w", err)
+	}
+	if err := s.privatize(); err != nil {
+		return nil, err
 	}
 	if err := s.loadTopics(); err != nil {
 		return nil, err
@@ -109,6 +113,48 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// privatize strips group and other permissions from the state dir and
+// everything babbl keeps in it. Payloads are often diffs and review comments,
+// so other users on the machine shouldn't be able to read them. MkdirAll and
+// OpenFile only apply modes to what they create, so this is what tightens
+// state left by older releases, which used 0755 and 0644. Symlinks are left
+// alone rather than followed to whatever they point at.
+func (s *Store) privatize() error {
+	if runtime.GOOS == "windows" {
+		return nil // permission bits don't govern access there
+	}
+	paths := []string{s.dir, s.topicsDir(), s.cursorsPath()}
+	entries, err := os.ReadDir(s.topicsDir())
+	if err != nil {
+		return fmt.Errorf("reading topics dir: %w", err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".jsonl") {
+			paths = append(paths, filepath.Join(s.topicsDir(), e.Name()))
+		}
+	}
+	for i, p := range paths {
+		stat := os.Lstat
+		if i == 0 {
+			stat = os.Stat // the state dir itself may be a symlink, e.g. to a volume
+		}
+		fi, err := stat(p)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("checking permissions: %w", err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 || fi.Mode().Perm()&0o077 == 0 {
+			continue
+		}
+		if err := os.Chmod(p, fi.Mode().Perm()&^0o077); err != nil {
+			return fmt.Errorf("restricting permissions: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) topicsDir() string   { return filepath.Join(s.dir, "topics") }
@@ -239,7 +285,7 @@ func (s *Store) appendToLog(m Message) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(s.topicPath(m.Topic), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(s.topicPath(m.Topic), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("opening topic log: %w", err)
 	}

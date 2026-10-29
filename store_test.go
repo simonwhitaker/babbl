@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -473,5 +474,88 @@ func TestDeleteLeavesOtherSubscribersParked(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("subscriber on another topic never received its message")
+	}
+}
+
+// Payloads are often diffs and review comments, so nothing babbl writes may
+// be readable by other users on the machine.
+func TestStoreStateIsPrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits don't govern access on Windows")
+	}
+	dir := filepath.Join(t.TempDir(), "state")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	s.Append("review", "secret diff", "")
+	s.Next(context.Background(), "review", "codex", false)
+
+	for _, p := range []string{dir, s.topicsDir(), s.topicPath("review"), s.cursorsPath()} {
+		assertPrivate(t, p)
+	}
+}
+
+// State from older releases was 0755/0644. Opening it tightens it in place and
+// still loads it.
+func TestOpenTightensExistingState(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits don't govern access on Windows")
+	}
+	dir := filepath.Join(t.TempDir(), "state")
+	topics := filepath.Join(dir, "topics")
+	log := filepath.Join(topics, "review.jsonl")
+	cursors := filepath.Join(dir, "cursors.json")
+	os.MkdirAll(topics, 0o755)
+	os.WriteFile(log, []byte(`{"topic":"review","id":0,"payload":"old"}`+"\n"), 0o644)
+	os.WriteFile(cursors, []byte(`{"review":{"codex":0}}`), 0o644)
+	for p, mode := range map[string]os.FileMode{dir: 0o755, topics: 0o755, log: 0o644, cursors: 0o644} {
+		os.Chmod(p, mode) // defeat the umask, so the starting point is really wide
+	}
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for _, p := range []string{dir, topics, log, cursors} {
+		assertPrivate(t, p)
+	}
+	if msgs, _ := s.Peek("review", 0, 0); len(msgs) != 1 || msgs[0].Payload != "old" {
+		t.Fatalf("existing topic not loaded: %+v", msgs)
+	}
+	// Owner bits are kept, not reset: a 0644 file becomes 0600, not 0700.
+	if fi, _ := os.Stat(log); fi.Mode().Perm() != 0o600 {
+		t.Errorf("%s is %v, want 0600", log, fi.Mode().Perm())
+	}
+}
+
+// A symlink in topics/ is left alone, not followed to chmod its target.
+func TestOpenDoesNotChmodThroughSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits don't govern access on Windows")
+	}
+	dir := filepath.Join(t.TempDir(), "state")
+	os.MkdirAll(filepath.Join(dir, "topics"), 0o700)
+	elsewhere := filepath.Join(t.TempDir(), "shared.jsonl")
+	os.WriteFile(elsewhere, nil, 0o644)
+	os.Chmod(elsewhere, 0o644)
+	os.Symlink(elsewhere, filepath.Join(dir, "topics", "linked.jsonl"))
+
+	if _, err := Open(dir); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if fi, _ := os.Stat(elsewhere); fi.Mode().Perm() != 0o644 {
+		t.Fatalf("symlink target changed to %v", fi.Mode().Perm())
+	}
+}
+
+func assertPrivate(t *testing.T, path string) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("%s is %v, want no group or other access", path, perm)
 	}
 }
