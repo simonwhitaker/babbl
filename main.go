@@ -15,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 )
@@ -270,6 +272,9 @@ name share one cursor.
 A name seen for the first time starts at the beginning of the topic and works
 through the backlog. Pass --latest to start at the end instead.
 
+On a terminal, control characters in the payload (such as escape sequences)
+are shown escaped. Piped or redirected, the payload is printed exactly.
+
 Exit codes: 0 a message was printed, 3 timed out with nothing to deliver,
 1 error.`,
 		Example: `  babbl sub review-comments --as codex
@@ -295,7 +300,8 @@ Exit codes: 0 a message was printed, 3 timed out with nothing to deliver,
 			if asJSON {
 				return printJSON(cmd.OutOrStdout(), m)
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), m.Payload)
+			out := cmd.OutOrStdout()
+			fmt.Fprintln(out, forDisplay(out)(m.Payload))
 			return nil
 		},
 	}
@@ -313,8 +319,12 @@ func peekCmd() *cobra.Command {
 	var asJSON bool
 
 	cmd := &cobra.Command{
-		Use:               "peek <topic>",
-		Short:             "Read a topic without advancing any cursor",
+		Use:   "peek <topic>",
+		Short: "Read a topic without advancing any cursor",
+		Long: `Read a topic without advancing any cursor.
+
+On a terminal, control characters in payloads (such as escape sequences) are
+shown escaped. Piped or redirected, payloads are printed exactly.`,
 		Args:              cobra.ExactArgs(1),
 		Example:           `  babbl peek review-comments --limit 5`,
 		ValidArgsFunction: completeTopic,
@@ -327,8 +337,9 @@ func peekCmd() *cobra.Command {
 			if asJSON {
 				return printJSON(out, msgs)
 			}
+			show := forDisplay(out)
 			for _, m := range msgs {
-				fmt.Fprintf(out, "[%d] %s\n", m.ID, m.Payload)
+				fmt.Fprintf(out, "[%d] %s\n", m.ID, show(m.Payload))
 			}
 			return nil
 		},
@@ -372,11 +383,14 @@ func topicsListCmd(use string) *cobra.Command {
 				fmt.Fprintln(out, "no topics yet")
 				return nil
 			}
+			// Names are validated on the way in, but cursors.json can be
+			// edited by hand, so treat them like any other wire text.
+			show := forDisplay(out)
 			for _, info := range infos {
-				fmt.Fprintf(out, "%s (%d %s)\n", info.Name, info.Count, plural(info.Count, "message"))
+				fmt.Fprintf(out, "%s (%d %s)\n", show(info.Name), info.Count, plural(info.Count, "message"))
 				for _, sub := range sortedKeys(info.Cursors) {
 					pos := info.Cursors[sub]
-					fmt.Fprintf(out, "  %s: %d/%d (%d unread)\n", sub, pos, info.Count, max(0, info.Count-pos))
+					fmt.Fprintf(out, "  %s: %d/%d (%d unread)\n", show(sub), pos, info.Count, max(0, info.Count-pos))
 				}
 			}
 			return nil
@@ -452,4 +466,55 @@ func sortedKeys(m map[string]int) []string {
 	}
 	slices.Sort(keys)
 	return keys
+}
+
+// forDisplay picks how to print text that arrived over the wire. Payloads and
+// subscriber names come from whoever published or subscribed, so printed raw
+// to a terminal they could carry escape sequences that recolour, retitle or
+// rewrite what the user sees. On a terminal, then, control characters are
+// shown escaped. Anywhere else (a pipe, a file, an agent's tool call) the text
+// passes through untouched, since a consumer there wants the exact payload.
+func forDisplay(w io.Writer) func(string) string {
+	if isTerminal(w) {
+		return escapeControls
+	}
+	return func(s string) string { return s }
+}
+
+// isTerminal reports whether w is a character device, which is how a terminal
+// shows up without pulling in x/term. /dev/null also counts, harmlessly.
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// escapeControls rewrites control characters, bidi overrides and invalid UTF-8
+// as Go-style escapes (\x1b, or \u and four hex digits), keeping newlines and tabs so multi-line
+// payloads still read naturally. A literal backslash is left alone: the output
+// is for reading, not for unquoting.
+func escapeControls(s string) string {
+	var b strings.Builder
+	for len(s) > 0 {
+		r, size := utf8.DecodeRuneInString(s)
+		switch {
+		case r == '\n' || r == '\t':
+			b.WriteRune(r)
+		case r == utf8.RuneError && size == 1:
+			fmt.Fprintf(&b, `\x%02x`, s[0]) // a byte that isn't valid UTF-8
+		case unicode.IsControl(r) || unicode.Is(unicode.Bidi_Control, r):
+			if r < 0x100 {
+				fmt.Fprintf(&b, `\x%02x`, r)
+			} else {
+				fmt.Fprintf(&b, `\u%04x`, r)
+			}
+		default:
+			b.WriteRune(r)
+		}
+		s = s[size:]
+	}
+	return b.String()
 }
