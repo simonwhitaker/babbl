@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
@@ -49,6 +51,21 @@ var ErrTopicDeleted = errors.New("topic deleted")
 
 // ErrInvalidSubscriber is returned for empty or malformed subscriber names.
 var ErrInvalidSubscriber = errors.New("invalid subscriber name")
+
+// ErrTopicConflict is returned for a new topic whose name differs from an
+// existing one only in case. On a case-insensitive filesystem, macOS's default,
+// the two would share one log file.
+var ErrTopicConflict = errors.New("topic name conflict")
+
+// windowsReserved are device names Windows won't use as a file name, whatever
+// the extension, so a topic called "con" or "nul.x" couldn't have a log there.
+var windowsReserved = map[string]bool{
+	"con": true, "prn": true, "aux": true, "nul": true,
+	"com1": true, "com2": true, "com3": true, "com4": true, "com5": true,
+	"com6": true, "com7": true, "com8": true, "com9": true,
+	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true, "lpt5": true,
+	"lpt6": true, "lpt7": true, "lpt8": true, "lpt9": true,
+}
 
 // ErrLimit is returned when a write would take the store past one of its
 // limits. Everything is held in memory, so without them one runaway publisher
@@ -107,6 +124,10 @@ type Store struct {
 	// Set it before the store is used. size is what is held now.
 	MaxBytes int64
 	size     int64
+
+	// Repairs describes anything Open had to fix to load the state, for the
+	// daemon to report.
+	Repairs []string
 }
 
 // msgSize is what a message counts against MaxBytes: the parts a publisher
@@ -198,9 +219,12 @@ func (s *Store) loadTopics() error {
 		if validTopic(topic) != nil {
 			continue
 		}
-		msgs, err := readLog(filepath.Join(s.topicsDir(), e.Name()))
+		msgs, repair, err := readLog(filepath.Join(s.topicsDir(), e.Name()))
 		if err != nil {
 			return fmt.Errorf("loading topic %q: %w", topic, err)
+		}
+		if repair != "" {
+			s.Repairs = append(s.Repairs, fmt.Sprintf("topic %s: %s", topic, repair))
 		}
 		s.topics[topic] = msgs
 		for _, m := range msgs {
@@ -210,29 +234,62 @@ func (s *Store) loadTopics() error {
 	return nil
 }
 
-func readLog(path string) ([]Message, error) {
+// readLog loads a topic log. A last line with no newline is the mark of a
+// write cut short by a crash: appendToLog writes each record and its newline
+// in one call, and only acknowledges the publish once that is synced. Such a
+// line is dropped, or, if it does parse (a hand edit, say), given the newline
+// it lacks so the next append doesn't run into it. Either way repair says what
+// was done. A bad line anywhere else is real corruption and stays an error.
+func readLog(path string) (msgs []Message, repair string, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer f.Close()
 
-	var msgs []Message
-	sc := bufio.NewScanner(f)
-	// Review comments can be long; allow generously sized lines.
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(strings.TrimSpace(string(line))) == 0 {
+	r := bufio.NewReaderSize(f, 64*1024)
+	var off int64 // end of the last complete line
+	for n := 1; ; n++ {
+		line, err := r.ReadBytes('\n')
+		if err != nil && err != io.EOF {
+			return nil, "", err
+		}
+		if err == io.EOF {
+			if len(bytes.TrimSpace(line)) == 0 {
+				return msgs, "", nil
+			}
+			var m Message
+			if json.Unmarshal(line, &m) == nil {
+				msgs = append(msgs, m)
+				return msgs, "added a missing final newline", appendNewline(path)
+			}
+			if err := os.Truncate(path, off); err != nil {
+				return nil, "", fmt.Errorf("dropping incomplete line %d: %w", n, err)
+			}
+			return msgs, fmt.Sprintf("dropped incomplete line %d (%d bytes), left by an interrupted write", n, len(line)), nil
+		}
+		off += int64(len(line))
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		var m Message
 		if err := json.Unmarshal(line, &m); err != nil {
-			return nil, fmt.Errorf("line %d: %w", len(msgs)+1, err)
+			return nil, "", fmt.Errorf("line %d: %w", n, err)
 		}
 		msgs = append(msgs, m)
 	}
-	return msgs, sc.Err()
+}
+
+func appendNewline(path string) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write([]byte{'\n'}); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func (s *Store) loadCursors() error {
@@ -294,8 +351,8 @@ func (s *Store) Append(topic, payload, from string) (Message, error) {
 		Published: time.Now().UTC(),
 	}
 	if s.MaxBytes > 0 && s.size+msgSize(m) > s.MaxBytes {
-		return Message{}, fmt.Errorf("%w: the store holds %d of the %d MB allowed by serve --max-store-mb; free space with babbl topics rm",
-			ErrLimit, s.size>>20, s.MaxBytes>>20)
+		return Message{}, fmt.Errorf("%w: the store holds %.1f of the %.1f MB allowed by serve --max-store-mb; free space with babbl topics rm",
+			ErrLimit, float64(s.size)/(1<<20), float64(s.MaxBytes)/(1<<20))
 	}
 	if err := s.appendToLog(m); err != nil {
 		return Message{}, err
@@ -318,11 +375,33 @@ func (s *Store) knownTopic(topic string) bool {
 // checkNewTopic applies the rules for creating a topic, which are stricter than
 // those for using one: names already on disk keep working. Caller must hold
 // s.mu.
+//
+// The rules apply on every platform, so a state directory stays portable
+// between them.
 func (s *Store) checkNewTopic(topic string) error {
 	if len(topic) > maxNameLen {
 		return fmt.Errorf("%w: at most %d characters", ErrInvalidTopic, maxNameLen)
 	}
+	base, _, _ := strings.Cut(strings.ToLower(topic), ".")
+	if windowsReserved[base] {
+		return fmt.Errorf("%w: %q is a reserved device name on Windows", ErrInvalidTopic, topic)
+	}
+	for name := range s.topics {
+		if strings.EqualFold(name, topic) {
+			return caseConflict(topic, name)
+		}
+	}
+	for name := range s.cursors {
+		if strings.EqualFold(name, topic) {
+			return caseConflict(topic, name)
+		}
+	}
 	return nil
+}
+
+func caseConflict(topic, existing string) error {
+	return fmt.Errorf("%w: %q differs from existing topic %q only in case, which some filesystems can't tell apart",
+		ErrTopicConflict, topic, existing)
 }
 
 // checkNewSubscriber applies the rules for a subscriber's first request on a

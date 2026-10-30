@@ -170,6 +170,9 @@ and would drown out everything else.`,
 				return err
 			}
 			store.MaxBytes = maxStoreMB << 20
+			for _, r := range store.Repairs {
+				fmt.Fprintf(os.Stderr, "babbl: repaired state: %s\n", r)
+			}
 
 			ln, err := net.Listen("tcp", addr(cmd))
 			if err != nil {

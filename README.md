@@ -157,7 +157,10 @@ message that starts with a dash:
 babbl pub notes -- '--this is not a flag'
 ```
 
-Topic and subscriber names must match `[A-Za-z0-9._-]+`.
+Topic and subscriber names must match `[A-Za-z0-9._-]+`, and new ones are
+limited to 128 characters. So that a state directory works on any filesystem, a
+new topic may not differ from an existing one only in case (`Review` beside
+`review`), or be a Windows device name such as `con` or `nul`.
 
 Shell completions (topic names are completed from the running daemon):
 
@@ -193,7 +196,7 @@ Compose file allows its service name, so other services can use
 Every message is held in memory, so the daemon has limits. It answers `507` to
 new messages once topics hold `--max-store-mb` in total (default 1024; `0` for
 no limit), and to new subscribers past 10,000 across all topics. `babbl topics
-rm` frees both. New topic and subscriber names are limited to 128 characters.
+rm` frees both.
 
 ## On-disk format
 

@@ -523,3 +523,13 @@ func TestServerReportsLimitAs507(t *testing.T) {
 		t.Fatalf("got %s, want 507", resp.Status)
 	}
 }
+
+func TestServerReportsCaseConflictAs409(t *testing.T) {
+	c, _ := newTestServer(t)
+	c.Publish(context.Background(), "review", "one", "")
+	resp, _ := http.Post(c.baseURL+"/topics/Review", "text/plain", strings.NewReader("two"))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("got %s, want 409", resp.Status)
+	}
+}

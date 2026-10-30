@@ -660,3 +660,128 @@ func TestStoreSubscriberLimit(t *testing.T) {
 		t.Fatalf("existing subscriber at the limit: %v", err)
 	}
 }
+
+// On a case-insensitive filesystem "Review" and "review" would share a log, so
+// a new topic may not differ from an existing one only in case.
+func TestStoreRejectsCaseOnlyTopicConflicts(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	expired, cancel := context.WithCancel(ctx)
+	cancel()
+
+	s.Append("review", "one", "")
+	s.Next(expired, "waiting", "codex", false) // a topic known only by its cursors
+
+	for _, tc := range []struct{ topic, existing string }{
+		{"Review", "review"},
+		{"REVIEW", "review"},
+		{"Waiting", "waiting"},
+	} {
+		_, err := s.Append(tc.topic, "x", "")
+		if !errors.Is(err, ErrTopicConflict) || !strings.Contains(err.Error(), `"`+tc.existing+`"`) {
+			t.Errorf("Append(%q): got %v, want a conflict naming %q", tc.topic, err, tc.existing)
+		}
+		if _, _, err := s.Next(expired, tc.topic, "codex", false); !errors.Is(err, ErrTopicConflict) {
+			t.Errorf("Next(%q): got %v, want ErrTopicConflict", tc.topic, err)
+		}
+	}
+
+	// The existing names themselves are fine, and so are unrelated ones.
+	for _, topic := range []string{"review", "waiting", "reviews"} {
+		if _, err := s.Append(topic, "x", ""); err != nil {
+			t.Errorf("Append(%q): %v", topic, err)
+		}
+	}
+	if n := len(s.Topics()); n != 3 {
+		t.Errorf("got %d topics, want 3", n)
+	}
+}
+
+func TestStoreRejectsWindowsReservedTopics(t *testing.T) {
+	s := newTestStore(t)
+	for _, bad := range []string{"con", "NUL", "Aux", "prn.txt", "com1", "lpt9.x.y"} {
+		if _, err := s.Append(bad, "x", ""); !errors.Is(err, ErrInvalidTopic) {
+			t.Errorf("Append(%q): got %v, want ErrInvalidTopic", bad, err)
+		}
+	}
+	for _, ok := range []string{"console", "com10", "com0", "nul-results", "my.con"} {
+		if _, err := s.Append(ok, "x", ""); err != nil {
+			t.Errorf("Append(%q): %v", ok, err)
+		}
+	}
+}
+
+// A crash mid-write leaves a last line with no newline. It was never
+// acknowledged, so Open drops it rather than refusing to start.
+func TestOpenDropsTornLastLine(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "topics"), 0o700)
+	log := filepath.Join(dir, "topics", "review.jsonl")
+	good := `{"topic":"review","id":0,"payload":"kept"}` + "\n"
+	os.WriteFile(log, []byte(good+`{"topic":"review","id":1,"pay`), 0o600)
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if len(s.Repairs) != 1 || !strings.Contains(s.Repairs[0], "dropped incomplete line 2") {
+		t.Errorf("Repairs = %q", s.Repairs)
+	}
+	if data, _ := os.ReadFile(log); string(data) != good {
+		t.Errorf("log after repair = %q, want %q", data, good)
+	}
+
+	// The next publish takes the dropped message's place and reloads cleanly.
+	if m, err := s.Append("review", "next", ""); err != nil || m.ID != 1 {
+		t.Fatalf("Append: %+v, %v", m, err)
+	}
+	s2, err := Open(dir)
+	if err != nil || len(s2.Repairs) != 0 {
+		t.Fatalf("reopen: %v, repairs %q", err, s2.Repairs)
+	}
+	if msgs, _ := s2.Peek("review", 0, 0); len(msgs) != 2 || msgs[1].Payload != "next" {
+		t.Fatalf("after reopen: %+v", msgs)
+	}
+}
+
+// A complete record that merely lacks its newline (a hand edit) is kept, and
+// the newline added so the next append doesn't run into it.
+func TestOpenKeepsCompleteLastLineWithoutNewline(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "topics"), 0o700)
+	log := filepath.Join(dir, "topics", "review.jsonl")
+	os.WriteFile(log, []byte(`{"topic":"review","id":0,"payload":"edited"}`), 0o600)
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if len(s.Repairs) != 1 || !strings.Contains(s.Repairs[0], "newline") {
+		t.Errorf("Repairs = %q", s.Repairs)
+	}
+	s.Append("review", "next", "")
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if msgs, _ := s2.Peek("review", 0, 0); len(msgs) != 2 || msgs[0].Payload != "edited" {
+		t.Fatalf("after reopen: %+v", msgs)
+	}
+}
+
+// Damage before the last line isn't a torn write, so it still stops Open
+// rather than being silently dropped.
+func TestOpenRefusesCorruptionMidLog(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "topics"), 0o700)
+	log := filepath.Join(dir, "topics", "review.jsonl")
+	data := `{"topic":"review","id":0,"payload":"a"}` + "\n" + "garbage\n" + `{"topic":"review","id":2,"payload":"c"}` + "\n"
+	os.WriteFile(log, []byte(data), 0o600)
+
+	if _, err := Open(dir); err == nil || !strings.Contains(err.Error(), "line 2") {
+		t.Fatalf("got %v, want an error at line 2", err)
+	}
+	if got, _ := os.ReadFile(log); string(got) != data {
+		t.Fatalf("log was modified: %q", got)
+	}
+}

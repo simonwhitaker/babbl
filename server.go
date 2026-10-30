@@ -263,6 +263,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, err)
 	case errors.Is(err, ErrTopicNotFound):
 		writeError(w, http.StatusNotFound, err)
+	case errors.Is(err, ErrTopicConflict):
+		writeError(w, http.StatusConflict, err)
 	case errors.Is(err, ErrTopicDeleted):
 		writeError(w, http.StatusGone, err)
 	case errors.Is(err, ErrLimit):
