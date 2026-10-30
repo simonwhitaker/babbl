@@ -148,8 +148,10 @@ read what you sent — its cursor tells you how far it has got.
 
 ## Names
 
-Topic and subscriber names must match `[A-Za-z0-9._-]+`. Topics are created on
-first publish; there is nothing to declare up front.
+Topic and subscriber names must match `[A-Za-z0-9._-]+`, up to 128 characters.
+Topics are created on first publish; there is nothing to declare up front. A
+new topic that differs from an existing one only in case is refused: use the
+existing name, as `babbl topics` lists it.
 
 Pick topic names that describe the payload, not the recipient
 (`review-comments`, `build-failures`, `diffs`), since anyone can subscribe.
