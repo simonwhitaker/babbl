@@ -118,6 +118,7 @@ func serveCmd() *cobra.Command {
 	var dir string
 	var verbose bool
 	var allowHosts []string
+	var maxStoreMB int64
 
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -133,6 +134,10 @@ name that other containers use to reach it:
 
   babbl serve --addr 0.0.0.0:8787 --allow-host babbl
 
+Every message is held in memory, so the daemon refuses new ones once topics
+hold --max-store-mb in total, and new subscribers past 10,000 across all
+topics. 'babbl topics rm' frees both.
+
 --verbose prints a line to stderr as each message is published, delivered, or
 peeked at:
 
@@ -143,6 +148,9 @@ Subscribers waiting on an empty topic are not logged; they re-poll on a timer
 and would drown out everything else.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if maxStoreMB < 0 {
+				return errors.New("--max-store-mb must be 0 (no limit) or more")
+			}
 			for _, h := range allowHosts {
 				if !validHostName(h) {
 					return fmt.Errorf("--allow-host %q: want a host name such as babbl or babbl.internal", h)
@@ -161,6 +169,7 @@ and would drown out everything else.`,
 			if err != nil {
 				return err
 			}
+			store.MaxBytes = maxStoreMB << 20
 
 			ln, err := net.Listen("tcp", addr(cmd))
 			if err != nil {
@@ -170,7 +179,15 @@ and would drown out everything else.`,
 			if verbose {
 				log = newEventLog(cmd.ErrOrStderr())
 			}
-			srv := &http.Server{Handler: NewServer(store, log, allowHosts...)}
+			srv := &http.Server{
+				Handler: NewServer(store, log, allowHosts...),
+				// Requests are tiny apart from their bodies, which NewServer
+				// caps itself. There is no WriteTimeout: a long poll is
+				// meant to sit open for up to maxWait.
+				ReadHeaderTimeout: 10 * time.Second,
+				IdleTimeout:       2 * time.Minute,
+				MaxHeaderBytes:    64 << 10,
+			}
 			fmt.Fprintf(os.Stderr, "babbl serving on %s (state: %s)\n", ln.Addr(), d)
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
@@ -197,6 +214,7 @@ and would drown out everything else.`,
 	cmd.Flags().StringVar(&dir, "dir", "", "state directory [$BABBL_DIR] (default $XDG_STATE_HOME/babbl, else ~/.local/state/babbl)")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "log each message as it is published and delivered")
 	cmd.Flags().StringArrayVar(&allowHosts, "allow-host", nil, "also accept requests addressed to this host name (repeatable)")
+	cmd.Flags().Int64Var(&maxStoreMB, "max-store-mb", 1024, "refuse new messages once topics hold this many MB in total (0 for no limit)")
 	return cmd
 }
 

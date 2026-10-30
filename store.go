@@ -38,7 +38,7 @@ var topicNameRE = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // ErrInvalidTopic is returned for topic names that would not map safely to a
 // filename. We reject rather than escape, so the on-disk layout stays readable.
-var ErrInvalidTopic = errors.New("invalid topic name: must match [A-Za-z0-9._-]+")
+var ErrInvalidTopic = errors.New("invalid topic name")
 
 // ErrTopicNotFound is returned when deleting a topic that doesn't exist.
 var ErrTopicNotFound = errors.New("no such topic")
@@ -48,7 +48,20 @@ var ErrTopicNotFound = errors.New("no such topic")
 var ErrTopicDeleted = errors.New("topic deleted")
 
 // ErrInvalidSubscriber is returned for empty or malformed subscriber names.
-var ErrInvalidSubscriber = errors.New("invalid subscriber name: must match [A-Za-z0-9._-]+")
+var ErrInvalidSubscriber = errors.New("invalid subscriber name")
+
+// ErrLimit is returned when a write would take the store past one of its
+// limits. Everything is held in memory, so without them one runaway publisher
+// or subscriber loop could grow the daemon without bound.
+var ErrLimit = errors.New("limit reached")
+
+// maxNameLen bounds new topic and subscriber names. It leaves a topic's
+// filename, with ".jsonl", well inside the usual 255-byte limit.
+const maxNameLen = 128
+
+// maxSubscriptions bounds the (topic, subscriber) pairs in cursors.json, which
+// is rewritten whole on every delivery.
+const maxSubscriptions = 10_000
 
 // validName is shared by topics and subscribers. The regex allows "." and
 // "..", which would be path traversal for a topic filename, so exclude them
@@ -60,14 +73,14 @@ func validName(name string) bool {
 
 func validTopic(name string) error {
 	if !validName(name) {
-		return ErrInvalidTopic
+		return fmt.Errorf("%w: must match [A-Za-z0-9._-]+", ErrInvalidTopic)
 	}
 	return nil
 }
 
 func validSubscriber(name string) error {
 	if !validName(name) {
-		return ErrInvalidSubscriber
+		return fmt.Errorf("%w: must match [A-Za-z0-9._-]+", ErrInvalidSubscriber)
 	}
 	return nil
 }
@@ -89,7 +102,16 @@ type Store struct {
 	// waiters at once. Waiters take a reference under the lock, release it,
 	// then select on the channel.
 	notify chan struct{}
+
+	// MaxBytes caps the message bytes held across all topics; 0 means no cap.
+	// Set it before the store is used. size is what is held now.
+	MaxBytes int64
+	size     int64
 }
+
+// msgSize is what a message counts against MaxBytes: the parts a publisher
+// controls, which dominate its footprint.
+func msgSize(m Message) int64 { return int64(len(m.Payload) + len(m.From)) }
 
 // Open loads any existing state from dir, creating it if necessary.
 func Open(dir string) (*Store, error) {
@@ -181,6 +203,9 @@ func (s *Store) loadTopics() error {
 			return fmt.Errorf("loading topic %q: %w", topic, err)
 		}
 		s.topics[topic] = msgs
+		for _, m := range msgs {
+			s.size += msgSize(m)
+		}
 	}
 	return nil
 }
@@ -256,6 +281,11 @@ func (s *Store) Append(topic, payload, from string) (Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if !s.knownTopic(topic) {
+		if err := s.checkNewTopic(topic); err != nil {
+			return Message{}, err
+		}
+	}
 	m := Message{
 		Topic:     topic,
 		ID:        len(s.topics[topic]),
@@ -263,13 +293,57 @@ func (s *Store) Append(topic, payload, from string) (Message, error) {
 		From:      from,
 		Published: time.Now().UTC(),
 	}
+	if s.MaxBytes > 0 && s.size+msgSize(m) > s.MaxBytes {
+		return Message{}, fmt.Errorf("%w: the store holds %d of the %d MB allowed by serve --max-store-mb; free space with babbl topics rm",
+			ErrLimit, s.size>>20, s.MaxBytes>>20)
+	}
 	if err := s.appendToLog(m); err != nil {
 		return Message{}, err
 	}
 	s.topics[topic] = append(s.topics[topic], m)
+	s.size += msgSize(m)
 
 	s.wake()
 	return m, nil
+}
+
+// knownTopic reports whether a topic has a log or any cursors. Caller must hold
+// s.mu.
+func (s *Store) knownTopic(topic string) bool {
+	_, hasLog := s.topics[topic]
+	_, hasCursors := s.cursors[topic]
+	return hasLog || hasCursors
+}
+
+// checkNewTopic applies the rules for creating a topic, which are stricter than
+// those for using one: names already on disk keep working. Caller must hold
+// s.mu.
+func (s *Store) checkNewTopic(topic string) error {
+	if len(topic) > maxNameLen {
+		return fmt.Errorf("%w: at most %d characters", ErrInvalidTopic, maxNameLen)
+	}
+	return nil
+}
+
+// checkNewSubscriber applies the rules for a subscriber's first request on a
+// topic. Caller must hold s.mu.
+func (s *Store) checkNewSubscriber(topic, subscriber string) error {
+	if !s.knownTopic(topic) {
+		if err := s.checkNewTopic(topic); err != nil {
+			return err
+		}
+	}
+	if len(subscriber) > maxNameLen {
+		return fmt.Errorf("%w: at most %d characters", ErrInvalidSubscriber, maxNameLen)
+	}
+	n := 0
+	for _, subs := range s.cursors {
+		n += len(subs)
+	}
+	if n >= maxSubscriptions {
+		return fmt.Errorf("%w: %d subscribers across all topics; free some with babbl topics rm", ErrLimit, n)
+	}
+	return nil
 }
 
 // wake releases every long-poll waiter so it re-checks its topic. Caller must
@@ -326,11 +400,17 @@ func (s *Store) Next(ctx context.Context, topic, subscriber string, fromLatest b
 		}
 		msgs := s.topics[topic]
 		subs, ok := s.cursors[topic]
+		pos, seen := subs[subscriber]
+		if !seen {
+			if err := s.checkNewSubscriber(topic, subscriber); err != nil {
+				s.mu.Unlock()
+				return Message{}, false, err
+			}
+		}
 		if !ok {
 			subs = map[string]int{}
 			s.cursors[topic] = subs
 		}
-		pos, seen := subs[subscriber]
 		if !seen && fromLatest {
 			pos = len(msgs)
 		}
@@ -430,6 +510,9 @@ func (s *Store) Delete(topic string) (messages, subscribers int, err error) {
 
 	if err := os.Remove(s.topicPath(topic)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return 0, 0, fmt.Errorf("removing topic log: %w", err)
+	}
+	for _, m := range msgs {
+		s.size -= msgSize(m)
 	}
 	delete(s.topics, topic)
 	return len(msgs), len(subs), nil

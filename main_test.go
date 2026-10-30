@@ -169,6 +169,13 @@ func TestServeRejectsBadAllowHost(t *testing.T) {
 	}
 }
 
+func TestServeRejectsNegativeMaxStore(t *testing.T) {
+	_, err := runCLI(t, "", "serve", "--dir", t.TempDir(), "--addr", "127.0.0.1:0", "--max-store-mb", "-1")
+	if err == nil || !strings.Contains(err.Error(), "--max-store-mb") {
+		t.Fatalf("got %v, want a --max-store-mb error", err)
+	}
+}
+
 // --help must exit cleanly and advertise GNU-style double-dash flags.
 func TestHelpIsCleanAndUsesDoubleDashes(t *testing.T) {
 	for _, args := range [][]string{{"pub", "--help"}, {"sub", "--help"}, {"--help"}} {

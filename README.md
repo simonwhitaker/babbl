@@ -190,6 +190,11 @@ container, allow that name with `--allow-host`; repeat it for several names. The
 Compose file allows its service name, so other services can use
 `http://babbl:8787`.
 
+Every message is held in memory, so the daemon has limits. It answers `507` to
+new messages once topics hold `--max-store-mb` in total (default 1024; `0` for
+no limit), and to new subscribers past 10,000 across all topics. `babbl topics
+rm` frees both. New topic and subscriber names are limited to 128 characters.
+
 ## On-disk format
 
 ```

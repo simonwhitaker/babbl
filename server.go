@@ -265,6 +265,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, err)
 	case errors.Is(err, ErrTopicDeleted):
 		writeError(w, http.StatusGone, err)
+	case errors.Is(err, ErrLimit):
+		writeError(w, http.StatusInsufficientStorage, err)
 	default:
 		writeError(w, http.StatusInternalServerError, err)
 	}

@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -557,5 +559,104 @@ func assertPrivate(t *testing.T, path string) {
 	}
 	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
 		t.Errorf("%s is %v, want no group or other access", path, perm)
+	}
+}
+
+func TestStoreMaxBytes(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Open(dir)
+	s.MaxBytes = 10
+
+	if _, err := s.Append("review", "123456", "ab"); err != nil { // 8 bytes
+		t.Fatalf("Append under the limit: %v", err)
+	}
+	if _, err := s.Append("review", "123", ""); !errors.Is(err, ErrLimit) { // would be 11
+		t.Fatalf("Append over the limit: got %v, want ErrLimit", err)
+	}
+	if msgs, _ := s.Peek("review", 0, 0); len(msgs) != 1 {
+		t.Fatalf("refused message was stored: %+v", msgs)
+	}
+	if _, err := s.Append("other", "12", ""); err != nil { // exactly 10
+		t.Fatalf("Append up to the limit: %v", err)
+	}
+
+	// Usage survives a restart, so the limit can't be dodged by restarting.
+	s2, _ := Open(dir)
+	s2.MaxBytes = 10
+	if _, err := s2.Append("review", "x", ""); !errors.Is(err, ErrLimit) {
+		t.Fatalf("after reopen: got %v, want ErrLimit", err)
+	}
+
+	// Deleting a topic gives its bytes back.
+	if _, _, err := s2.Delete("review"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := s2.Append("review", "12345678", ""); err != nil {
+		t.Fatalf("Append after delete: %v", err)
+	}
+}
+
+func TestStoreNameLengthLimit(t *testing.T) {
+	dir := t.TempDir()
+	long := strings.Repeat("a", maxNameLen+1)
+
+	// A long topic left by an older release still loads and still works.
+	os.MkdirAll(filepath.Join(dir, "topics"), 0o700)
+	os.WriteFile(filepath.Join(dir, "topics", long+".jsonl"), []byte(`{"topic":"`+long+`","id":0,"payload":"old"}`+"\n"), 0o600)
+	os.WriteFile(filepath.Join(dir, "cursors.json"), []byte(`{"review":{"`+long+`":0}}`), 0o600)
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := s.Append(long, "new", ""); err != nil {
+		t.Errorf("Append to existing long topic: %v", err)
+	}
+	s.Append("review", "hi", "")
+	if _, ok, err := s.Next(ctx, "review", long, false); err != nil || !ok {
+		t.Errorf("Next as existing long subscriber: ok=%v, err=%v", ok, err)
+	}
+
+	// New names are capped.
+	if _, err := s.Append(strings.Repeat("b", maxNameLen), "x", ""); err != nil {
+		t.Errorf("Append to a %d-character topic: %v", maxNameLen, err)
+	}
+	if _, err := s.Append(strings.Repeat("b", maxNameLen+1), "x", ""); !errors.Is(err, ErrInvalidTopic) {
+		t.Errorf("Append to a new over-long topic: got %v, want ErrInvalidTopic", err)
+	}
+	expired, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _, err := s.Next(expired, strings.Repeat("c", maxNameLen+1), "codex", false); !errors.Is(err, ErrInvalidTopic) {
+		t.Errorf("Next on a new over-long topic: got %v, want ErrInvalidTopic", err)
+	}
+	if _, _, err := s.Next(expired, "review", strings.Repeat("d", maxNameLen+1), false); !errors.Is(err, ErrInvalidSubscriber) {
+		t.Errorf("Next as a new over-long subscriber: got %v, want ErrInvalidSubscriber", err)
+	}
+	if infos := s.Topics(); len(infos) != 3 || len(infos[2].Cursors) != 1 {
+		t.Errorf("refused requests left state behind: %+v", infos)
+	}
+}
+
+func TestStoreSubscriberLimit(t *testing.T) {
+	s := newTestStore(t)
+	s.Append("review", "hi", "")
+	full := map[string]int{}
+	for i := range maxSubscriptions - 1 {
+		full[fmt.Sprintf("s%d", i)] = 0
+	}
+	s.cursors["busy"] = full
+	ctx := context.Background()
+
+	if _, _, err := s.Next(ctx, "review", "last", false); err != nil {
+		t.Fatalf("subscriber up to the limit: %v", err)
+	}
+	if _, _, err := s.Next(ctx, "review", "one-too-many", false); !errors.Is(err, ErrLimit) {
+		t.Fatalf("subscriber over the limit: got %v, want ErrLimit", err)
+	}
+	// Subscribers that already have a cursor are unaffected.
+	expired, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _, err := s.Next(expired, "busy", "s0", false); err != nil {
+		t.Fatalf("existing subscriber at the limit: %v", err)
 	}
 }
