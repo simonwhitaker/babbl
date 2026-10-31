@@ -508,3 +508,28 @@ func TestClientNextUsesPOST(t *testing.T) {
 		t.Fatalf("client sent %v, want [POST]", methods)
 	}
 }
+
+// A store over its limit answers 507, which the CLI reports with the reason.
+func TestServerReportsLimitAs507(t *testing.T) {
+	c, store := newTestServer(t)
+	store.MaxBytes = 4
+	_, err := c.Publish(context.Background(), "review", "too long", "")
+	if err == nil || !strings.Contains(err.Error(), "max-store-mb") {
+		t.Fatalf("got %v, want an error naming --max-store-mb", err)
+	}
+	resp, _ := http.Post(c.baseURL+"/topics/review", "text/plain", strings.NewReader("too long"))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusInsufficientStorage {
+		t.Fatalf("got %s, want 507", resp.Status)
+	}
+}
+
+func TestServerReportsCaseConflictAs409(t *testing.T) {
+	c, _ := newTestServer(t)
+	c.Publish(context.Background(), "review", "one", "")
+	resp, _ := http.Post(c.baseURL+"/topics/Review", "text/plain", strings.NewReader("two"))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("got %s, want 409", resp.Status)
+	}
+}

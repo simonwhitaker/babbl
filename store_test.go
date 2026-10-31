@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -557,5 +559,229 @@ func assertPrivate(t *testing.T, path string) {
 	}
 	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
 		t.Errorf("%s is %v, want no group or other access", path, perm)
+	}
+}
+
+func TestStoreMaxBytes(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Open(dir)
+	s.MaxBytes = 10
+
+	if _, err := s.Append("review", "123456", "ab"); err != nil { // 8 bytes
+		t.Fatalf("Append under the limit: %v", err)
+	}
+	if _, err := s.Append("review", "123", ""); !errors.Is(err, ErrLimit) { // would be 11
+		t.Fatalf("Append over the limit: got %v, want ErrLimit", err)
+	}
+	if msgs, _ := s.Peek("review", 0, 0); len(msgs) != 1 {
+		t.Fatalf("refused message was stored: %+v", msgs)
+	}
+	if _, err := s.Append("other", "12", ""); err != nil { // exactly 10
+		t.Fatalf("Append up to the limit: %v", err)
+	}
+
+	// Usage survives a restart, so the limit can't be dodged by restarting.
+	s2, _ := Open(dir)
+	s2.MaxBytes = 10
+	if _, err := s2.Append("review", "x", ""); !errors.Is(err, ErrLimit) {
+		t.Fatalf("after reopen: got %v, want ErrLimit", err)
+	}
+
+	// Deleting a topic gives its bytes back.
+	if _, _, err := s2.Delete("review"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := s2.Append("review", "12345678", ""); err != nil {
+		t.Fatalf("Append after delete: %v", err)
+	}
+}
+
+func TestStoreNameLengthLimit(t *testing.T) {
+	dir := t.TempDir()
+	long := strings.Repeat("a", maxNameLen+1)
+
+	// A long topic left by an older release still loads and still works.
+	os.MkdirAll(filepath.Join(dir, "topics"), 0o700)
+	os.WriteFile(filepath.Join(dir, "topics", long+".jsonl"), []byte(`{"topic":"`+long+`","id":0,"payload":"old"}`+"\n"), 0o600)
+	os.WriteFile(filepath.Join(dir, "cursors.json"), []byte(`{"review":{"`+long+`":0}}`), 0o600)
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := s.Append(long, "new", ""); err != nil {
+		t.Errorf("Append to existing long topic: %v", err)
+	}
+	s.Append("review", "hi", "")
+	if _, ok, err := s.Next(ctx, "review", long, false); err != nil || !ok {
+		t.Errorf("Next as existing long subscriber: ok=%v, err=%v", ok, err)
+	}
+
+	// New names are capped.
+	if _, err := s.Append(strings.Repeat("b", maxNameLen), "x", ""); err != nil {
+		t.Errorf("Append to a %d-character topic: %v", maxNameLen, err)
+	}
+	if _, err := s.Append(strings.Repeat("b", maxNameLen+1), "x", ""); !errors.Is(err, ErrInvalidTopic) {
+		t.Errorf("Append to a new over-long topic: got %v, want ErrInvalidTopic", err)
+	}
+	expired, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _, err := s.Next(expired, strings.Repeat("c", maxNameLen+1), "codex", false); !errors.Is(err, ErrInvalidTopic) {
+		t.Errorf("Next on a new over-long topic: got %v, want ErrInvalidTopic", err)
+	}
+	if _, _, err := s.Next(expired, "review", strings.Repeat("d", maxNameLen+1), false); !errors.Is(err, ErrInvalidSubscriber) {
+		t.Errorf("Next as a new over-long subscriber: got %v, want ErrInvalidSubscriber", err)
+	}
+	if infos := s.Topics(); len(infos) != 3 || len(infos[2].Cursors) != 1 {
+		t.Errorf("refused requests left state behind: %+v", infos)
+	}
+}
+
+func TestStoreSubscriberLimit(t *testing.T) {
+	s := newTestStore(t)
+	s.Append("review", "hi", "")
+	full := map[string]int{}
+	for i := range maxSubscriptions - 1 {
+		full[fmt.Sprintf("s%d", i)] = 0
+	}
+	s.cursors["busy"] = full
+	ctx := context.Background()
+
+	if _, _, err := s.Next(ctx, "review", "last", false); err != nil {
+		t.Fatalf("subscriber up to the limit: %v", err)
+	}
+	if _, _, err := s.Next(ctx, "review", "one-too-many", false); !errors.Is(err, ErrLimit) {
+		t.Fatalf("subscriber over the limit: got %v, want ErrLimit", err)
+	}
+	// Subscribers that already have a cursor are unaffected.
+	expired, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _, err := s.Next(expired, "busy", "s0", false); err != nil {
+		t.Fatalf("existing subscriber at the limit: %v", err)
+	}
+}
+
+// On a case-insensitive filesystem "Review" and "review" would share a log, so
+// a new topic may not differ from an existing one only in case.
+func TestStoreRejectsCaseOnlyTopicConflicts(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	expired, cancel := context.WithCancel(ctx)
+	cancel()
+
+	s.Append("review", "one", "")
+	s.Next(expired, "waiting", "codex", false) // a topic known only by its cursors
+
+	for _, tc := range []struct{ topic, existing string }{
+		{"Review", "review"},
+		{"REVIEW", "review"},
+		{"Waiting", "waiting"},
+	} {
+		_, err := s.Append(tc.topic, "x", "")
+		if !errors.Is(err, ErrTopicConflict) || !strings.Contains(err.Error(), `"`+tc.existing+`"`) {
+			t.Errorf("Append(%q): got %v, want a conflict naming %q", tc.topic, err, tc.existing)
+		}
+		if _, _, err := s.Next(expired, tc.topic, "codex", false); !errors.Is(err, ErrTopicConflict) {
+			t.Errorf("Next(%q): got %v, want ErrTopicConflict", tc.topic, err)
+		}
+	}
+
+	// The existing names themselves are fine, and so are unrelated ones.
+	for _, topic := range []string{"review", "waiting", "reviews"} {
+		if _, err := s.Append(topic, "x", ""); err != nil {
+			t.Errorf("Append(%q): %v", topic, err)
+		}
+	}
+	if n := len(s.Topics()); n != 3 {
+		t.Errorf("got %d topics, want 3", n)
+	}
+}
+
+func TestStoreRejectsWindowsReservedTopics(t *testing.T) {
+	s := newTestStore(t)
+	for _, bad := range []string{"con", "NUL", "Aux", "prn.txt", "com1", "lpt9.x.y"} {
+		if _, err := s.Append(bad, "x", ""); !errors.Is(err, ErrInvalidTopic) {
+			t.Errorf("Append(%q): got %v, want ErrInvalidTopic", bad, err)
+		}
+	}
+	for _, ok := range []string{"console", "com10", "com0", "nul-results", "my.con"} {
+		if _, err := s.Append(ok, "x", ""); err != nil {
+			t.Errorf("Append(%q): %v", ok, err)
+		}
+	}
+}
+
+// A crash mid-write leaves a last line with no newline. It was never
+// acknowledged, so Open drops it rather than refusing to start.
+func TestOpenDropsTornLastLine(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "topics"), 0o700)
+	log := filepath.Join(dir, "topics", "review.jsonl")
+	good := `{"topic":"review","id":0,"payload":"kept"}` + "\n"
+	os.WriteFile(log, []byte(good+`{"topic":"review","id":1,"pay`), 0o600)
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if len(s.Repairs) != 1 || !strings.Contains(s.Repairs[0], "dropped incomplete line 2") {
+		t.Errorf("Repairs = %q", s.Repairs)
+	}
+	if data, _ := os.ReadFile(log); string(data) != good {
+		t.Errorf("log after repair = %q, want %q", data, good)
+	}
+
+	// The next publish takes the dropped message's place and reloads cleanly.
+	if m, err := s.Append("review", "next", ""); err != nil || m.ID != 1 {
+		t.Fatalf("Append: %+v, %v", m, err)
+	}
+	s2, err := Open(dir)
+	if err != nil || len(s2.Repairs) != 0 {
+		t.Fatalf("reopen: %v, repairs %q", err, s2.Repairs)
+	}
+	if msgs, _ := s2.Peek("review", 0, 0); len(msgs) != 2 || msgs[1].Payload != "next" {
+		t.Fatalf("after reopen: %+v", msgs)
+	}
+}
+
+// A complete record that merely lacks its newline (a hand edit) is kept, and
+// the newline added so the next append doesn't run into it.
+func TestOpenKeepsCompleteLastLineWithoutNewline(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "topics"), 0o700)
+	log := filepath.Join(dir, "topics", "review.jsonl")
+	os.WriteFile(log, []byte(`{"topic":"review","id":0,"payload":"edited"}`), 0o600)
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if len(s.Repairs) != 1 || !strings.Contains(s.Repairs[0], "newline") {
+		t.Errorf("Repairs = %q", s.Repairs)
+	}
+	s.Append("review", "next", "")
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if msgs, _ := s2.Peek("review", 0, 0); len(msgs) != 2 || msgs[0].Payload != "edited" {
+		t.Fatalf("after reopen: %+v", msgs)
+	}
+}
+
+// Damage before the last line isn't a torn write, so it still stops Open
+// rather than being silently dropped.
+func TestOpenRefusesCorruptionMidLog(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "topics"), 0o700)
+	log := filepath.Join(dir, "topics", "review.jsonl")
+	data := `{"topic":"review","id":0,"payload":"a"}` + "\n" + "garbage\n" + `{"topic":"review","id":2,"payload":"c"}` + "\n"
+	os.WriteFile(log, []byte(data), 0o600)
+
+	if _, err := Open(dir); err == nil || !strings.Contains(err.Error(), "line 2") {
+		t.Fatalf("got %v, want an error at line 2", err)
+	}
+	if got, _ := os.ReadFile(log); string(got) != data {
+		t.Fatalf("log was modified: %q", got)
 	}
 }

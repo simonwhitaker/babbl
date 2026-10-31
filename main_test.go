@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // startDaemon runs a throwaway daemon and points the CLI at it via BABBL_ADDR.
@@ -168,6 +169,13 @@ func TestServeRejectsBadAllowHost(t *testing.T) {
 	}
 }
 
+func TestServeRejectsNegativeMaxStore(t *testing.T) {
+	_, err := runCLI(t, "", "serve", "--dir", t.TempDir(), "--addr", "127.0.0.1:0", "--max-store-mb", "-1")
+	if err == nil || !strings.Contains(err.Error(), "--max-store-mb") {
+		t.Fatalf("got %v, want a --max-store-mb error", err)
+	}
+}
+
 // --help must exit cleanly and advertise GNU-style double-dash flags.
 func TestHelpIsCleanAndUsesDoubleDashes(t *testing.T) {
 	for _, args := range [][]string{{"pub", "--help"}, {"sub", "--help"}, {"--help"}} {
@@ -310,5 +318,62 @@ func TestTopicCompletionWithoutDaemon(t *testing.T) {
 	}
 	if !strings.HasPrefix(out, ":4\n") {
 		t.Fatalf("unexpected completions without a daemon:\n%s", out)
+	}
+}
+
+func TestEscapeControls(t *testing.T) {
+	for in, want := range map[string]string{
+		"fix nil deref in foo.go:42":              "fix nil deref in foo.go:42",
+		"line one\n\tindented":                    "line one\n\tindented",
+		"\x1b[31mred\x1b[0m":                      `\x1b[31mred\x1b[0m`,
+		"\x1b]0;pwned\x07":                        `\x1b]0;pwned\x07`, // retitles the terminal
+		"looks fine\rlies":                        `looks fine\x0dlies`,
+		"\u009b31m":                               `\x9b31m`, // C1 CSI
+		"evil" + string(rune(0x202e)) + "gnp.exe": `evil\u` + "202egnp.exe",
+		"bad \xff byte":                           `bad \xff byte`,
+		"real " + string(utf8.RuneError) + " replacement char": "real " + string(utf8.RuneError) + " replacement char",
+		"naïve café 日本 🎉":                                      "naïve café 日本 🎉",
+		`already \x1b escaped`:                                 `already \x1b escaped`,
+	} {
+		if got := escapeControls(in); got != want {
+			t.Errorf("escapeControls(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Agents read sub's stdout through a pipe and need the exact payload; only a
+// terminal gets the escaped form.
+func TestOutputIsEscapedOnlyOnATerminal(t *testing.T) {
+	const payload = "\x1b[31mred\x1b[0m"
+
+	var buf bytes.Buffer
+	if got := forDisplay(&buf)(payload); got != payload {
+		t.Errorf("non-terminal output altered: %q", got)
+	}
+
+	// /dev/null is a character device, so it stands in for a terminal.
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Skip(err)
+	}
+	defer devnull.Close()
+	if !isTerminal(devnull) {
+		t.Skipf("%s is not a character device here", os.DevNull)
+	}
+	if got := forDisplay(devnull)(payload); got != `\x1b[31mred\x1b[0m` {
+		t.Errorf("terminal output not escaped: %q", got)
+	}
+}
+
+func TestSubAndPeekPrintExactPayloadWhenPiped(t *testing.T) {
+	store := startDaemon(t)
+	const payload = "\x1b[31mred\x1b[0m\r\n\ttwo"
+	store.Append("review", payload, "")
+
+	if out, err := runCLI(t, "", "peek", "review"); err != nil || out != "[0] "+payload+"\n" {
+		t.Errorf("peek printed %q (err %v)", out, err)
+	}
+	if out, err := runCLI(t, "", "sub", "review", "--as", "codex"); err != nil || out != payload+"\n" {
+		t.Errorf("sub printed %q (err %v)", out, err)
 	}
 }
