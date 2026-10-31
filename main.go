@@ -81,7 +81,7 @@ Environment:
 	}
 
 	root.PersistentFlags().String("addr", addrFromEnv(), "daemon address [$BABBL_ADDR]")
-	root.AddCommand(serveCmd(), pubCmd(), subCmd(), peekCmd(), topicsCmd())
+	root.AddCommand(serveCmd(), pubCmd(), subCmd(), peekCmd(), topicsCmd(), versionCmd())
 	return root
 }
 
