@@ -31,6 +31,8 @@ Or from a checkout:
 go build -o babbl .
 ```
 
+Check what's installed with `babbl version`.
+
 ## Add the skill to your agent
 
 ```sh
